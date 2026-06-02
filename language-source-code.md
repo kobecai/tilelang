@@ -2,6 +2,39 @@
 
 这份笔记整理 `tilelang/language` 目录的职责、核心设计、关键代码细节和推荐阅读路线。重点不是只列文件名，而是解释：**用户写的 Python DSL 是如何被捕获、转换成 TIRX `PrimFunc`，并保留高层 tile op 给后续 compiler pass lowering 的**。
 
+## 目录
+
+- [1. 一句话结论](#1-一句话结论)
+- [2. 核心心智模型](#2-核心心智模型)
+- [核心精髓：两种 JIT 风格与 AST 改写](#核心精髓两种-jit-风格与-ast-改写)
+- [3. 从用户代码到 CUDA/HIP/CPU 的整体数据流](#3-从用户代码到-cudahipcpu-的整体数据流)
+- [4. 推荐阅读顺序](#4-推荐阅读顺序)
+- [5. `__init__.py`：`T` 命名空间的总菜单](#5-__init__pyt-命名空间的总菜单)
+- [6. `kernel.py`：`T.Kernel` 与 launch frame 机制](#6-kernelpytkernel-与-launch-frame-机制)
+- [7. `eager/ast.py`：Python AST 如何变成 Builder 调用](#7-eagerastpypython-ast-如何变成-builder-调用)
+- [8. `eager/builder.py`：真正的 IR 施工队](#8-eagerbuilderpy真正的-ir-施工队)
+- [9. `proxy.py`：Tensor、Buffer、ptr 类型代理](#9-proxypytensorbufferptr-类型代理)
+- [10. `allocate.py`：内存模型与 scope 字符串](#10-allocatepy内存模型与-scope-字符串)
+- [11. `loop.py`：循环抽象与编译策略](#11-looppy循环抽象与编译策略)
+- [12. `copy_op.py`：数据移动的高层 TileOp](#12-copy_oppy数据移动的高层-tileop)
+- [13. `gemm_op.py`：GEMM 高层 TileOp](#13-gemm_oppygemm-高层-tileop)
+- [14. `reduce_op.py`：Reduction 与 macro 展开](#14-reduce_oppyreduction-与-macro-展开)
+- [15. `frame.py`：Let 值和 BufferRegion alias 追踪](#15-framepylet-值和-bufferregion-alias-追踪)
+- [16. `annotations.py`：编译 hint 注入](#16-annotationspy编译-hint-注入)
+- [17. `warpgroup.py`：Warp Specialization scope](#17-warpgrouppywarp-specialization-scope)
+- [18. `builtin.py` 与底层 intrinsic 包装](#18-builtinpy-与底层-intrinsic-包装)
+- [19. `tir/`、`parser/`、`overrides/`：TVM Script 兼容层](#19-tirparseroverridestvm-script-兼容层)
+- [20. 下游边界：`language/` 生成的 IR 在哪里被兑现](#20-下游边界language-生成的-ir-在哪里被兑现)
+- [21. 一个 DSL 片段如何落成 IR：逐行解释](#21-一个-dsl-片段如何落成-ir逐行解释)
+- [22. 常见误区](#22-常见误区)
+- [23. 建议的源码实验](#23-建议的源码实验)
+- [24. 阅读时抓住的 6 个关键问题](#24-阅读时抓住的-6-个关键问题)
+- [25. 文件职责速查表](#25-文件职责速查表)
+- [26. 最后总结](#26-最后总结)
+- [27. `KernelLaunchFrame`、`TIRFrame`、`FrameStack` 问答补充](#27-kernellaunchframetirframeframestack-问答补充)
+- [28. `register_object`、`_ffi_api` 和 C++ FFI 绑定顺序](#28-register_object_ffi_api-和-c-ffi-绑定顺序)
+- [29. `@tilelang.jit`、AST、IRGenerator 补充问答](#29-tilelangjitastirgenerator-补充问答)
+
 ---
 
 ## 1. 一句话结论
@@ -2236,4 +2269,599 @@ get_block_bindings() 从 self.frames[0:-4] 取 blockIdx.*。
 get_thread_bindings() 从 self.frames[-4:-1] 取 threadIdx.x/y/z。
 SBlockFrame 是 kernel body 的 TIR statement block，不是三维索引。
 TIRFrame / KernelLaunchFrame 是构造 TIR 时的辅助结构，最终产物是 TIR tree。
+```
+
+---
+
+## 28. `register_object`、`_ffi_api` 和 C++ FFI 绑定顺序
+
+这一章补充 `tilelang/language/kernel.py` 里的这一行：
+
+```python
+@register_object("tl.KernelLaunchFrame")
+class KernelLaunchFrame(TIRFrame):
+        ...
+```
+
+问题的核心是：`register_object` 不是 Python 标准库里的东西，而是 TVM/TVM-FFI 提供的 Python-C++ 对象系统注册接口。它负责把 C++ 侧的 FFI object type key，绑定到 Python 侧的包装类。
+
+### 28.1 `register_object` 来自哪里
+
+`kernel.py` 里写的是：
+
+```python
+from tvm.ffi import register_object
+```
+
+但在这个仓库里，`tvm.ffi` 基本只是转发到 `tvm_ffi`：
+
+```python
+# 3rdparty/tvm/python/tvm/ffi.py
+from tvm_ffi import *
+```
+
+真正实现位于：
+
+```text
+3rdparty/tvm/3rdparty/tvm-ffi/python/tvm_ffi/registry.py
+```
+
+核心逻辑可以简化成：
+
+```python
+def register_object(type_key: str | None = None, *, init: bool = True):
+        def _register(cls, object_name):
+                type_index = core._object_type_key_to_index(object_name)
+                if type_index is None:
+                        raise ValueError(f"Cannot find object type index for {object_name}")
+                info = core._register_object_by_index(type_index, cls)
+                setattr(cls, "__tvm_ffi_type_info__", info)
+                return cls
+```
+
+也就是说，`@register_object("tl.KernelLaunchFrame")` 做的不是“创建一个 Python 类”，而是：
+
+```text
+拿字符串 "tl.KernelLaunchFrame"
+    -> 去 C++/FFI 类型系统里查 type index
+    -> 把这个 type index 绑定到 Python class KernelLaunchFrame
+```
+
+如果 C++ 侧没有先注册 `"tl.KernelLaunchFrame"`，这里会找不到 object type index，然后报错。
+
+### 28.2 C++ 侧如何声明这个对象类型
+
+C++ 侧对应代码在 `src/ir.cc`：
+
+```cpp
+class KernelLaunchFrameNode : public TIRFrameNode {
+public:
+    Array<TIRFrame> frames;
+
+    static void RegisterReflection() {
+        namespace refl = reflection;
+        refl::ObjectDef<KernelLaunchFrameNode>().def_ro(
+                "frames", &KernelLaunchFrameNode::frames);
+    }
+
+    TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.KernelLaunchFrame",
+                                                                        KernelLaunchFrameNode, TIRFrameNode);
+};
+```
+
+这里最重要的是：
+
+```cpp
+TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.KernelLaunchFrame", ...)
+```
+
+它声明了这个 C++ Object 的 type key。Python 里的装饰器必须写同一个字符串：
+
+```python
+@register_object("tl.KernelLaunchFrame")
+```
+
+所以 Python 和 C++ 不是靠文件名、类名自动匹配，而是靠这个 type key 字符串精确关联。
+
+### 28.3 `KernelLaunch` 函数如何暴露给 Python
+
+对象类型注册是一条线，函数注册是另一条线。
+
+C++ 侧 `KernelLaunch(...)` 是一个普通 C++ 函数：
+
+```cpp
+KernelLaunchFrame KernelLaunch(const Array<PrimExpr> &grid_size,
+                                                             const Optional<Array<PrimExpr>> &block_size_opt,
+                                                             const Map<String, Any> &attrs) {
+    ObjectPtr<KernelLaunchFrameNode> n = make_object<KernelLaunchFrameNode>();
+    ...
+    return KernelLaunchFrame(n);
+}
+```
+
+然后通过 FFI global registry 暴露出去：
+
+```cpp
+TVM_FFI_STATIC_INIT_BLOCK() {
+    namespace refl = reflection;
+    refl::GlobalDef()
+            .def("tl.Parallel", ParallelFor)
+            .def("tl.Pipelined", PipelinedFor)
+            .def("tl.Persistent", PersistentFor)
+            .def("tl.KernelLaunch", KernelLaunch);
+}
+```
+
+这行：
+
+```cpp
+.def("tl.KernelLaunch", KernelLaunch)
+```
+
+注册的是“可调用函数”。它和 `@register_object("tl.KernelLaunchFrame")` 不是同一件事。
+
+可以这样区分：
+
+```text
+GlobalDef().def("tl.KernelLaunch", KernelLaunch)
+    注册 C++ 函数，让 Python 能调用 _ffi_api.KernelLaunch(...)
+
+TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.KernelLaunchFrame", ...)
++ @register_object("tl.KernelLaunchFrame")
+    注册对象类型映射，让 C++ 返回的对象能包装成 Python KernelLaunchFrame
+```
+
+### 28.4 `_ffi_api.py` 怎么把 C++ 函数变成 Python 函数
+
+TileLang 有一个很小的文件：
+
+```python
+# tilelang/_ffi_api.py
+import tvm_ffi
+
+tvm_ffi.init_ffi_api("tl", __name__)
+```
+
+`init_ffi_api("tl", __name__)` 会扫描 FFI global registry 里所有以 `tl.` 开头的函数。
+
+比如 C++ 注册了：
+
+```text
+tl.KernelLaunch
+tl.Parallel
+tl.Pipelined
+```
+
+那么 Python module `tilelang._ffi_api` 里就会被自动挂上：
+
+```python
+_ffi_api.KernelLaunch
+_ffi_api.Parallel
+_ffi_api.Pipelined
+```
+
+简化后的逻辑是：
+
+```python
+def init_ffi_api(namespace: str, target_module_name: str | None = None):
+        prefix = namespace
+        target_module = sys.modules[target_module_name]
+
+        for name in list_global_func_names():
+                if not name.startswith(prefix):
+                        continue
+
+                fname = name[len(prefix) + 1:]
+                if "." in fname:
+                        continue
+
+                f = get_global_func(name)
+                setattr(target_module, fname, f)
+```
+
+所以 `kernel.py` 里能写：
+
+```python
+from tilelang import _ffi_api
+
+return _ffi_api.KernelLaunch(blocks, threads, attrs)
+```
+
+本质上是在调用 C++ 注册的 `tl.KernelLaunch`。
+
+### 28.5 import 顺序：从 `import tilelang` 到 `T.Kernel(...)`
+
+一次典型 import 的顺序可以理解成：
+
+```text
+1. import tilelang
+
+2. 进入 tilelang/__init__.py
+     - import tvm
+     - 找到 libtilelang.dylib / libtilelang.so / tvm_compiler.dll
+     - 用 ctypes.CDLL(...) 加载 TileLang C++ 动态库
+
+3. 动态库被加载
+     - C++ 静态初始化块执行
+     - TVM_FFI_STATIC_INIT_BLOCK 注册 tl.* 函数
+     - C++ object type key 也进入 FFI 类型系统
+
+4. tilelang/__init__.py 继续 import tilelang.language
+
+5. tilelang/language/__init__.py import .kernel
+
+6. tilelang/language/kernel.py 执行
+     - from tvm.ffi import register_object
+     - from tilelang import _ffi_api
+
+7. tilelang/_ffi_api.py 执行
+     - tvm_ffi.init_ffi_api("tl", __name__)
+     - 把 C++ 注册的 tl.KernelLaunch 暴露成 _ffi_api.KernelLaunch
+
+8. kernel.py 执行类定义装饰器
+     - @register_object("tl.KernelLaunchFrame")
+     - 查 C++ FFI type key
+     - 把 type index 绑定到 Python class KernelLaunchFrame
+```
+
+这里的关键顺序是：动态库必须先加载，C++ 侧的 `tl.*` 函数和 object type key 才会出现在 FFI registry 里。然后 Python 的 `_ffi_api` 和 `register_object` 才能根据这些已注册信息进行绑定。
+
+### 28.6 当用户写 `with T.Kernel(...)` 时发生什么
+
+完整调用链可以压缩成：
+
+```text
+with T.Kernel(grid, threads=128) as bx:
+        ...
+
+T.Kernel(...)
+    -> Python 函数 tilelang.language.kernel.Kernel
+    -> 检查 Builder.current()
+    -> 规范化 threads / cluster_dims / attrs
+    -> 调 _ffi_api.KernelLaunch(blocks, threads, attrs)
+
+_ffi_api.KernelLaunch(...)
+    -> 调 C++ global function "tl.KernelLaunch"
+    -> C++ 创建 KernelLaunchFrameNode
+    -> 填入 blockIdx/threadIdx frames 和 tilelang_root block
+    -> 返回 C++ KernelLaunchFrame 对象
+
+返回 Python
+    -> tvm_ffi 看到对象 type key 是 "tl.KernelLaunchFrame"
+    -> 查到 Python class KernelLaunchFrame
+    -> 包装成 Python KernelLaunchFrame 实例
+
+Python with 语义
+    -> 调 KernelLaunchFrame.__enter__
+    -> super().__enter__ 进入底层 TIRFrame scope
+    -> push 到 Python thread-local FrameStack
+    -> 返回 block binding，例如 bx/by/bz
+
+退出 with
+    -> 调 KernelLaunchFrame.__exit__
+    -> 从 FrameStack pop 当前 frame
+    -> super().__exit__ 退出底层 TIRFrame scope
+```
+
+所以 `@register_object("tl.KernelLaunchFrame")` 的作用可以一句话概括为：
+
+```text
+它让 C++ 返回的 tl.KernelLaunchFrame FFI 对象，在 Python 里变成 tilelang.language.kernel.KernelLaunchFrame 实例，
+从而拥有 Python 侧定义的 __enter__ / __exit__ / get_thread_binding 等行为。
+```
+
+### 28.7 两种 registry 的心智模型
+
+最后可以把这套机制拆成两张 registry 表：
+
+```text
+Global function registry
+    key: "tl.KernelLaunch"
+    value: C++ 函数 KernelLaunch
+    Python 入口: _ffi_api.KernelLaunch(...)
+
+Object type registry
+    key: "tl.KernelLaunchFrame"
+    value: C++ KernelLaunchFrameNode type info + Python KernelLaunchFrame class
+    Python 入口: @register_object("tl.KernelLaunchFrame")
+```
+
+两者一起工作，才得到最终效果：
+
+```text
+Python 能调用 C++ 函数，且 C++ 返回的对象能恢复成正确的 Python 包装类。
+```
+
+这也是 TileLang 里很多 API 的共同模式：
+
+```text
+Python DSL 函数很薄
+    -> 参数整理
+    -> 调 _ffi_api.xxx
+    -> C++ 创建/变换 IR object
+    -> Python register_object 提供包装类和便捷方法
+```
+
+## 29. `@tilelang.jit`、AST、IRGenerator 补充问答
+
+这一章整理两个常见追问：
+
+1. `@tilelang.jit` 到底怎么运作，跟 `tilelang/language/` 目录相关的调用链是什么。
+2. Python AST、`IRGenerator`、`IRBuilder` 分别是什么，它们之间是什么关系。
+
+### 29.1 `@tilelang.jit` 的职责
+
+`@tilelang.jit` 自己不是 parser，也不是 IR builder。它更像一个 **JIT 包装层**：
+
+- 在装饰阶段把原函数包装成 `JITImpl`
+- 在第一次调用时判断这是 `lazy style` 还是 `eager style`
+- 通过 `tilelang/language/eager/` 里的机制把用户函数变成 `PrimFunc`
+- 再把 `PrimFunc` 交给后续 compile / cache / backend pipeline
+
+压缩成一句话：
+
+```text
+@tilelang.jit 负责调度；
+tilelang/language/eager 负责把 Python DSL 变成 PrimFunc。
+```
+
+### 29.2 装饰阶段的调用链
+
+当用户写：
+
+```python
+@tilelang.jit
+def foo(...):
+    ...
+```
+
+装饰阶段的关键调用链是：
+
+```text
+tilelang.jit.jit(...)
+    -> tilelang.language.eager.builder.prim_func(func, eager_jit=True)
+    -> tilelang.language.eager.ast.mutate(func)
+    -> 返回 JITFunc
+    -> 用 JITFunc 构造 JITImpl
+```
+
+这里有两个关键点：
+
+- `mutate(func)` 会把原始 Python 函数的 AST 改写成一个 IR 生成函数。
+- `prim_func(..., eager_jit=True)` 这一步不会立刻生成 `PrimFunc`，而是先返回 `JITFunc`，把真正的 IR 构建延迟到函数第一次调用时。
+
+### 29.3 调用阶段：先判定 lazy/eager，再生成 PrimFunc
+
+当用户第一次调用 `foo(...)` 时，主链路是：
+
+```text
+JITImpl.__call__
+    -> JITImpl._infer_jit_mode()
+    -> JITFunc._is_lazy_style()
+    -> JITFunc.parse_args()
+    -> JITImpl.compile()
+    -> JITImpl.get_tir()
+    -> JITFunc.get_tir()
+```
+
+真正跟 `tilelang/language/` 相关的是 `get_tir()` 这段。
+
+#### lazy style
+
+如果用户函数内部返回一个 `@T.prim_func`：
+
+```python
+@tilelang.jit
+def make_kernel(M, N):
+    @T.prim_func
+    def kernel(...):
+        ...
+    return kernel
+```
+
+则：
+
+```text
+外层函数执行
+    -> 内层 @T.prim_func 直接构造 PrimFunc
+    -> 外层返回 PrimFunc
+    -> JITImpl 再编译这个 PrimFunc
+```
+
+这里的 `@T.prim_func` 默认走 `tilelang.language.eager.builder.prim_func(..., eager_jit=False)`。  
+也就是说，虽然用户感觉这是“lazy 风格”，但语言层的 `PrimFunc` 构造仍然是经过 `eager/builder.py` 的。
+
+#### eager style
+
+如果用户直接在 `@tilelang.jit` 的函数体里写：
+
+```python
+@tilelang.jit
+def kernel(A, B):
+    M, N = T.const("M N")
+    A: T.Tensor((M, N), "float16")
+    with T.Kernel(...):
+        ...
+```
+
+则它会走两阶段 eager JIT：
+
+```text
+phase1
+    -> Builder(eager_jit="phase1")
+    -> 执行改写后的 IRGenerator
+    -> 收集 constexpr / tensor 参数 / 模板 PrimFunc
+
+phase2
+    -> 从真实 tensor shape/stride 提取 M/N/...
+    -> Builder(eager_jit="phase2")
+    -> 再执行一次 IRGenerator
+    -> 得到最终 PrimFunc
+```
+
+所以 eager 模式下，用户函数体其实会被“以构造 IR 的方式执行两次”，而不是按普通 Python 运行时语义执行一次。
+
+### 29.4 跟 `tilelang/language/` 目录最相关的调用链
+
+如果只保留语言层相关模块，可以把主链总结成：
+
+```text
+原始 Python 函数
+    -> tilelang.language.eager.ast.mutate
+    -> IRGenerator
+    -> tilelang.language.eager.builder.Builder
+    -> tilelang.language.kernel / proxy / allocate / loop / builtin ...
+    -> Builder 内部驱动 IRBuilder / tirx frame
+    -> PrimFunc
+```
+
+一个典型的 eager kernel 子链看起来是：
+
+```text
+with T.Kernel(...)
+    -> tilelang.language.kernel.Kernel(...)
+    -> _ffi_api.KernelLaunch(...)
+    -> 返回 KernelLaunchFrame
+    -> Builder.ctx_with(...)
+    -> Builder.with_frame(...)
+    -> KernelLaunchFrame.__enter__()
+```
+
+因此：
+
+- `kernel.py` 负责 launch frame 语义
+- `proxy.py` 负责 Tensor/Buffer 代理类型
+- `allocate.py` 负责 allocation API
+- `loop.py` 负责循环 frame API
+- `eager/ast.py` 负责把 Python 语法改写成 Builder 调用
+- `eager/builder.py` 负责把这些调用落成真实 TIR/TIRX IR
+
+### 29.5 Python AST 是什么
+
+AST 是 Abstract Syntax Tree，抽象语法树。  
+它表示的是“这段 Python 代码的结构”，不是执行结果。
+
+例如：
+
+```python
+def foo(x):
+    y = x + 1
+    return y
+```
+
+在 AST 层面，它会是这样的结构元素：
+
+- `FunctionDef`
+- `Assign`
+- `Name("y")`
+- `BinOp(x, Add, 1)`
+- `Return`
+
+TileLang 先拿到这棵 AST，然后做改写。  
+这个动作在：
+
+```text
+tilelang.language.eager.ast.mutate(func)
+```
+
+它的作用不是“读源码用于展示”，而是：
+
+- 识别 `if / for / with / return / 赋值`
+- 把这些 Python 语句改写成对 `Builder` 的调用
+- 让原本看起来像 Python 的 DSL 代码，最终变成“构建 IR 的 Python 代码”
+
+### 29.6 `IRGenerator` 是什么
+
+`IRGenerator` 不是 IR，也不是 builder。  
+它是 AST 改写之后得到的一个 **IR 生成器包装对象**。
+
+可以把它理解成：
+
+```text
+“一段已经被 AST mutator 改写过、执行时会调用 Builder API 的 Python 函数”
+```
+
+它的核心字段是：
+
+```python
+IRGenerator(
+    gen=Callable[[BaseBuilder], Callable[..., ...]],
+    source=...,
+    extra_type_hints=...,
+)
+```
+
+其中：
+
+- `gen(builder)` 会返回一个闭包函数
+- 这个闭包在执行时，不再是普通 Python 语义，而是会调用 `builder.bind`、`builder.ctx_for`、`builder.ctx_with`、`builder.ret` 等方法
+
+所以 `IRGenerator` 的作用是：
+
+- 保存改写后的函数逻辑
+- 延迟到真正构建 IR 时再执行
+- 执行时把语句导向 `Builder`
+
+### 29.7 `IRBuilder` 是什么
+
+`IRBuilder` 是更底层的 TVM/TIRX IR 构造器。  
+TileLang 的 `Builder` 内部持有它：
+
+```text
+Builder
+    └── self.ir_builder = IRBuilder()
+```
+
+真正往 TIR/TIRX 里写节点的是这层：
+
+- `Builder.prim_func(...)` 打开 `IRBuilder` 上下文
+- `Builder.ctx_if / ctx_for / bind / ret / eval ...` 内部调用 `tirx.*`
+- `Builder.get()` 最后从 `IRBuilder` 里取出 `PrimFunc`
+
+所以三者职责分别是：
+
+- AST：原始 Python 函数的语法结构
+- `IRGenerator`：AST 改写后的“生成函数包装器”
+- `IRBuilder`：底层真实的 IR 构造器
+
+### 29.8 `IRBuilder` 接收的是 `IRGenerator` 吗
+
+不是。
+
+更准确的关系是：
+
+```text
+Python 函数
+    -> AST
+    -> IRGenerator
+    -> Builder
+    -> IRBuilder
+    -> PrimFunc
+```
+
+也就是说：
+
+- `IRGenerator` 执行时接收的是 `Builder`
+- `Builder` 再去驱动 `IRBuilder`
+
+不是：
+
+```text
+IRBuilder(IRGenerator)
+```
+
+而是：
+
+```text
+IRGenerator --执行--> Builder --使用--> IRBuilder
+```
+
+### 29.9 一个最短心智模型
+
+如果只记一句话，记这个：
+
+```text
+@tilelang.jit 负责包装和调度；
+AST 改写负责把 Python DSL 变成 Builder 调用；
+Builder 再借助 IRBuilder 把这些调用落成 PrimFunc。
 ```

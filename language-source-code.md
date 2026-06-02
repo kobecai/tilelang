@@ -6,7 +6,7 @@
 
 - [1. 一句话结论](#1-一句话结论)
 - [2. 核心心智模型](#2-核心心智模型)
-- [核心精髓：两种 JIT 风格与 AST 改写](#核心精髓两种-jit-风格与-ast-改写)
+- [2.1 核心精髓：两种 JIT 风格与 AST 改写](#21-核心精髓两种-jit-风格与-ast-改写)
 - [3. 从用户代码到 CUDA/HIP/CPU 的整体数据流](#3-从用户代码到-cudahipcpu-的整体数据流)
 - [4. 推荐阅读顺序](#4-推荐阅读顺序)
 - [5. `__init__.py`：`T` 命名空间的总菜单](#5-__init__pyt-命名空间的总菜单)
@@ -31,9 +31,17 @@
 - [24. 阅读时抓住的 6 个关键问题](#24-阅读时抓住的-6-个关键问题)
 - [25. 文件职责速查表](#25-文件职责速查表)
 - [26. 最后总结](#26-最后总结)
-- [27. `KernelLaunchFrame`、`TIRFrame`、`FrameStack` 问答补充](#27-kernellaunchframetirframeframestack-问答补充)
-- [28. `register_object`、`_ffi_api` 和 C++ FFI 绑定顺序](#28-register_object_ffi_api-和-c-ffi-绑定顺序)
-- [29. `@tilelang.jit`、AST、IRGenerator 补充问答](#29-tilelangjitastirgenerator-补充问答)
+- [附录 A. `KernelLaunchFrame`、`TIRFrame`、`FrameStack` 问答补充](#附录-a-kernellaunchframetirframeframestack-问答补充)
+- [附录 B. `register_object`、`_ffi_api` 和 C++ FFI 绑定顺序](#附录-b-register_object_ffi_api-和-c-ffi-绑定顺序)
+- [附录 C. `@tilelang.jit`、AST、IRGenerator 补充问答](#附录-c-tilelangjitastirgenerator-补充问答)
+
+---
+
+阅读时可以按三层理解这份文档：
+
+- **主线章节 1-4**：先建立整体心智模型、JIT 风格、数据流和推荐阅读顺序。
+- **源码章节 5-20**：按文件/模块解释 `language/` 里每个 API 如何构造 TIR/TIRX，以及下游 pass 在哪里消费这些语义。
+- **实践与附录 21-26、A-C**：用例子、误区、实验和问答补齐细节；附录保留多次源码追问中的细节，但不打断主线阅读。
 
 ---
 
@@ -112,9 +120,9 @@ IR Builder / Frame 层
 
 ---
 
-## 核心精髓：两种 JIT 风格与 AST 改写
+## 2.1 核心精髓：两种 JIT 风格与 AST 改写
 
-如果只能抓住 `language/` 的一个核心机制，那就是这一段：**TileLang 同时支持 lazy style 和 eager style；lazy style 基本走 TVM script parser，eager style 则靠 TileLang 自己的 AST mutator 把 Python 函数改写成 Builder 调用。**
+如果只能抓住 `language/` 的一个核心机制，那就是这一段：**TileLang 同时支持 lazy style 和 eager style；lazy style 是“外层 JIT 函数返回一个已构造好的 PrimFunc”，eager style 则是“外层 JIT 函数本身被 AST mutator 改写并通过 Builder trace 成 PrimFunc”。**
 
 这也是 `eager/ast.py` 和 `eager/builder.py` 的存在意义。
 
@@ -137,7 +145,8 @@ def make_kernel(M, N):
 
 关键点：
 
-- 内部 `@T.prim_func` 基本走 TVM/TIR script parser 路线。
+- 当前主导出的 `@T.prim_func` 来自 `tilelang/language/eager/builder.py` 的 `prim_func(..., eager_jit=False)`，也会通过 `mutate(func)` 和 `Builder` 构造 PrimFunc。
+- `tilelang/language/tir/entry.py` 和 `parser/` 里仍有 TVM script parser 兼容入口，但不是当前 `import tilelang.language as T` 下最后生效的 `T.prim_func` 主入口。
 - 外层函数被调用后，直接返回 `PrimFunc`。
 - `JITFunc` 会把这个 `PrimFunc` 缓存为一个 `TirTemplate.from_lazy_style(...)`。
 - 这种风格适合“先生成 kernel object，再单独调用/查看/benchmark”的流程。
@@ -372,6 +381,8 @@ tilelang.lower(...)
 
 `tilelang/engine/lower.py` 会通过 `resolve_pipeline(target)` 选择对应 backend pipeline。
 
+`resolve_pipeline(target)` 的实现很简单：按 `target.kind.name` 从 registry 中取 `PassPipeline`。因此 pipeline 名字要和 TVM target kind 对齐，比如 `cuda`、`hip`、`metal`、`c`、`llvm`。
+
 ---
 
 ## 4. 推荐阅读顺序
@@ -437,22 +448,27 @@ import tilelang.language as T
 
 | 来源 | 暴露能力 |
 | --- | --- |
-| `tvm.tirx.script.parser.*` | 基础 TIR script parser 能力，兼容 `@T.prim_func`、TIR 类型/表达式 |
+| `tvm.tirx.script.parser.*` | 基础 TIR script parser 能力和 TIR 类型/表达式；部分名称会被后续 `.eager` 导入覆盖 |
 | `.eager` | eager JIT 的 `prim_func`、`macro`、`const` 等 |
 | `.tir.ir` | TIR 基础表达式、数学函数、loop wrappers |
-| `.proxy` | `Tensor`、`Buffer`、`ptr`、`make_tensor`、`SharedBuffer`、`FragmentBuffer` |
+| `.proxy` | `Tensor`、`StridedTensor`、`Buffer`、`ptr`、`make_tensor`、`make_tensor_from_addr`、`SharedBuffer`、`FragmentBuffer`、`LocalBuffer` |
 | `.kernel` | `Kernel`、`CUDASourceCodeKernel`、`KernelLaunchFrame`、thread/block binding 查询 |
-| `.allocate` | `alloc_shared`、`alloc_fragment`、`alloc_local`、`alloc_var`、`alloc_barrier`、`alloc_tmem` |
-| `.loop` | `Parallel`、`Pipelined`、`Persistent`、`serial`、`unroll`、`vectorized` |
-| `.copy_op` | `copy`、`async_copy`、`tma_copy`、`copy_cluster`、`transpose`、`im2col` |
-| `.gemm_op` | `gemm`、`wgmma_gemm`、`tcgen05_gemm`、blockscaled GEMM |
-| `.reduce_op` | `reduce_sum/max/min`、`finalize_reducer`、`warp_reduce_*` |
-| `.customize` | atomics、`dp4a`、`reshape`、`view`、`loop_break` |
+| `.allocate` | `alloc_shared`、`alloc_fragment`、`alloc_local`、`alloc_global`、`alloc_var`、`alloc_barrier`、`alloc_cluster_barrier`、`alloc_tmem`、`alloc_reducer`、descriptor allocation、`empty` |
+| `.loop` | `Parallel`、`Pipelined`、`Persistent`、`serial`、`unroll`、`vectorized` 以及大写 alias |
+| `.copy_op` | `copy`、`async_copy`、`tma_copy`、`tma_gather4/scatter4`、`copy_cluster`、`transpose`、`im2col` |
+| `.gemm_op` | `gemm`、`wgmma_gemm`、`tcgen05_gemm`、`tcgen05_gemm_blockscaled`、`make_blockscaled_gemm_layout` |
+| `.experimental.gemm_sp_op` | sparse GEMM 变体：`gemm_sp`、`wgmma_gemm_sp`、`tcgen05_gemm_sp` |
+| `.reduce_op` | `reduce_*`、`finalize_reducer`、`warp_reduce_*` |
+| `.fill_op` / `.scan_op` / `.print_op` | `fill/clear`、`cumsum/cummax`、device-side print/assert |
+| `.customize` / `.atomic` | atomics、`dp4a`、`reshape`、`view`、`loop_break` |
 | `.annotations` | layout/swizzle/L2/restrict/min blocks per SM hints |
 | `.builtin` | GPU intrinsic、barrier、shuffle、WGMMA/TCGEN05 helper、load/store intrinsic |
 | `.cluster` | cluster barrier、cluster copy/cancel 查询等 |
 | `.pdl` | CUDA PDL trigger/sync |
 | `.warpgroup` | `T.ws` warp-specialization scope |
+| `.symbolics` / `.random` / `.utils` | dynamic/symbolic marker、random API、index 工具 |
+
+此外，`language/__init__.py` 自己还定义了 `import_source(source)`，本质上是把 `pragma_import_c` 挂到当前 statement block，用于注入外部 C/CUDA 代码片段。
 
 读这个文件时不要纠结每个 import 的实现，只要先建立一张分类地图。
 
@@ -482,6 +498,7 @@ with T.Kernel(grid_x, grid_y, threads=128) as (bx, by):
 1. 检查当前是否有 `Builder.current()`。
    - 没有 Builder，说明不在 `@tilelang.jit` 或 `@T.prim_func` 上下文里，抛 `JITNoBuilderError`。
 2. 规范化 `threads`。
+   - GPU kernel 不传 `threads` 时默认用 `128`。
    - `128` -> `[128, 1, 1]`
    - `(64, 2)` -> `[64, 2, 1]`
    - CPU kernel 下允许不传 thread binding。
@@ -498,23 +515,27 @@ with T.Kernel(grid_x, grid_y, threads=128) as (bx, by):
 return _ffi_api.KernelLaunch(blocks, threads, attrs)
 ```
 
+这里的 `prelude` 不是 Python 运行时逻辑，而是以 `pragma_import_c` 形式挂到 kernel block annotation 上，后续 split/codegen 时会注入到生成代码里。
+
 ### 6.3 C++ 侧真正创建 frame
 
 C++ 实现在 `src/ir.cc` 的 `KernelLaunch(...)`。
 
-GPU kernel 情况下它会创建：
+GPU kernel 情况下它会创建 launch-thread frames：
 
 ```text
-grid_size[0] -> blockIdx.x / bx
-grid_size[1] -> blockIdx.y / by
-grid_size[2] -> blockIdx.z / bz
+grid_size[0] -> blockIdx.x / bx   # 如果 grid_size 至少 1 维
+grid_size[1] -> blockIdx.y / by   # 如果 grid_size 至少 2 维
+grid_size[2] -> blockIdx.z / bz   # 如果 grid_size 至少 3 维
 
 block_size[0] -> threadIdx.x / tx
 block_size[1] -> threadIdx.y / ty
 block_size[2] -> threadIdx.z / tz
 
-最后加一个 tilelang_root block
+最后加一个 tilelang_root SBlockFrame，承载 kernel body 和 attrs
 ```
+
+CPU kernel 情况下不创建 `threadIdx.*`，而是为每个 grid 维度创建普通 iter var frame，最后同样追加 `tilelang_root` block。这个差异会影响 `KernelLaunchFrame.__enter__` 返回的变量：GPU 返回 block binding，CPU 返回普通 loop var。
 
 也就是说，`T.Kernel` 是 Python DSL 到 TIR launch-thread frame 的桥。
 
@@ -546,6 +567,8 @@ tx, ty, tz = T.get_thread_bindings()
 ```
 
 这个设计体现了 TileLang 的默认抽象层级：用户通常在 block/tile 级别写 kernel，线程映射更多通过 `T.Parallel`、layout inference、tile op lowering 处理。
+
+CPU kernel 情况下，最后一个 `SBlockFrame` 的 annotation 里带有 `tilelang.is_cpu_kernel_frame`。`__enter__` 会排除最后的 `SBlockFrame`，返回前面普通 for frame 的 `vars[0]`；也就是说 CPU 路径没有 `threadIdx.x/y/z` 这三个 frame。
 
 ### 6.5 thread-local stack 为什么重要
 
@@ -588,6 +611,20 @@ with T.Kernel(n) as (bx,):
 
 单维 kernel 可以返回裸 `Var`，但又能被当成单元素 iterable unpack。
 
+### 6.7 `CUDASourceCodeKernel`
+
+`kernel.py` 还提供 `T.CUDASourceCodeKernel(...)`，用于在 TileLang kernel 里嵌入一段外部 CUDA source 或 source 文件路径。
+
+它的主线和 `T.Kernel` 相似，但多了 source 处理：
+
+1. 检查 `Builder.current()`，不在 Builder 上下文则抛 `JITNoBuilderError`。
+2. `_load_cuda_source(...)` 判断参数是文件路径还是 inline CUDA source。
+3. 校验 `entry_name`，默认入口名是 `main_kernel`。
+4. 把 `code_block_source` 和 `code_block_entry_name` 写入 attrs。
+5. 进入 `_ffi_api.KernelLaunch(...)` frame，并发射一个 `tirx.call_extern("int32", entry_name)`。
+
+下游 `tilelang_callback_cuda_validate` 会检查外部 source 至少包含一个 `__global__` kernel，并要求 lowered device `global_symbol` 与 `entry_name` 匹配。这个 API 适合把已经写好的 CUDA kernel 作为 TileLang IR 的一个 device launch block 管起来，而不是让 Python 侧直接 launch CUDA。
+
 ---
 
 ## 7. `eager/ast.py`：Python AST 如何变成 Builder 调用
@@ -621,6 +658,8 @@ class IRGenerator:
 ```
 
 `gen(builder)` 会返回一个可以执行的函数，执行时所有 DSL 语义都会走 `builder`。
+
+当前实现还会收集 `extra_type_hints`。这主要服务 eager 函数参数：如果函数体里写了参数 annotation，例如 `A: T.Tensor(...)` 或 `A: T.float32`，mutator 会把这些类型信息保存下来，后续 `prim_func(..., eager_jit=True)` 用它识别哪些参数是 tensor/buffer 参数。
 
 ### 7.2 `if` 改写
 
@@ -715,6 +754,22 @@ if __tb.skip_kernel_ctx():
 
 用于 eager JIT 的阶段控制和参数推导。
 
+### 7.7 其他语法改写
+
+除了 `if/for/with/return` 主线，当前 `DSLMutator` 还处理了一批容易被忽略的 Python 语法：
+
+| Python 语法 | 改写/处理方式 | 作用 |
+| --- | --- | --- |
+| `while cond:` | `for _ in __tb.ctx_while(lambda: cond)` | `PrimExpr` 条件生成 TIR `While`；常量真会被视为潜在无限循环 |
+| `continue` / `break` | `__tb.ctx_continue()` / `__tb.ctx_break()` | 发射 `tirx.continue_loop()` / `tirx.break_loop()`，并标记后续语句无效 |
+| `assert cond, msg` | `__tb.assert_expr(cond, msg)` | Python bool 直接检查，`PrimExpr` 生成 TIR `Assert` frame |
+| `a += b` | `__tb.aug_assign(...)` 或 `__tb.aug_assign_slice(...)` | 支持 `local.var`、`Ref`、buffer slice 的更新语义 |
+| `a and b` / `a or b` / `not a` | `__tb.boolop(...)` | Python bool 短路；`PrimExpr` 生成 TIR logical op |
+| `x if cond else y` | `__tb.ifexp(cond, lambda: x, lambda: y)` | `PrimExpr` 条件生成 `tirx.if_then_else` |
+| 语句 span | `__tb.set_fileline(...)` | 给 Builder 记录原始文件/行号，macro 展开时用于更可读的诊断 |
+
+这说明 eager AST 改写不是只覆盖 “TileLang API 调用”，而是尽量把常见 Python 控制流和赋值语义映射到可构造 TIR 的 Builder hook。
+
 ---
 
 ## 8. `eager/builder.py`：真正的 IR 施工队
@@ -732,19 +787,26 @@ class Builder(BaseBuilder):
         self.ir_builder = IRBuilder()
         self.name_inside_frame = {}
         self.out_idx = []
+        self.out_tensor_cnt = 0
         self.constexpr_var = set()
         self.eager_jit = "none"  # phase1 / phase2 / none
         self.eager_jit_subs = {}
         self.func_pass_configs = None
         self.func_compile_flags = None
+        self.current_file = "<unknown>"
+        self.current_line = 0
+        self.current_macro_name = "<unknown-macro>"
 ```
 
 几个关键点：
 
 - `frames`：追踪当前进入的 TIR frame，比如 PrimFuncFrame、ForFrame、IfFrame、KernelLaunchFrame。
 - `ir_builder`：底层 TVM/TIRX IRBuilder。
+- `out_idx/out_tensor_cnt`：追踪 eager style 里 `T.empty(...)` 生成的输出 tensor 是否都被 `return`。
 - `constexpr_var`：eager JIT 动态 shape 推导用。
 - `eager_jit`：分两阶段处理动态 shape。
+- `func_pass_configs/func_compile_flags`：函数体内 annotation 最终会写到 PrimFunc attrs，再由 JIT compile 合并。
+- `current_file/current_line/current_macro_name`：由 AST mutator 注入的 `set_fileline` 更新，主要用于更清晰的诊断和 macro 调用栈。
 
 ### 8.2 thread-local current Builder
 
@@ -824,6 +886,8 @@ for v in T.serial(ceildiv(stop - start, step)):
     i = start + v * step
 ```
 
+当前实现会显式拒绝常量 `step == 0`；负 step 会按 `ceildiv(start - stop, -step)` 计算 trip count。非静态 step 可以走通，但 Builder 会 warning，因为动态 step 容易让 trip count 和边界行为不直观。
+
 ### 8.6 `eval`
 
 `Builder.eval` 负责把 expression statement 落入 IR：
@@ -874,7 +938,20 @@ def foo(x):
 
 `reduce_op.py` 的 `reduce_macro` 就是这种用法。
 
-### 8.9 lazy/eager JIT 判断
+### 8.9 `return` 与 `T.empty`
+
+eager style 的 `return` 不是任意返回 Python 对象。`Builder.ret(...)` 当前只允许返回由 `T.empty(...)` 声明出来的输出 buffer：
+
+```python
+C = T.empty((M, N), dtype=dtype)
+return C
+```
+
+如果有多个 `T.empty(...)`，它们都必须被返回；否则 `Builder.prim_func(...)` 退出时会报 `Not all tensor allocated from T.empty are returned`。这是因为 eager JIT 需要把输出 tensor 映射成 PrimFunc 的输出 buffer，并把 `tilelang_out_idx` 写入函数 attrs，供外层 `tilelang.jit.compile(...)` 推导返回值。
+
+`T.annotate_pass_configs(...)` 和 `T.annotate_compile_flags(...)` 也走类似路线：Builder 先记录到 `func_pass_configs/func_compile_flags`，构造完成后 `_patch_prim_func_attrs(...)` 写成 `tilelang_pass_configs` / `tilelang_compile_flags`。外层 JIT compile 会读取这些 attrs，并和调用方传入的 `pass_configs/compile_flags` 合并。
+
+### 8.10 lazy/eager JIT 判断
 
 `JITFunc` 负责同时支持两种风格。
 
@@ -907,6 +984,7 @@ def kernel(A):
 - 如果函数内部含 `@T.prim_func`，视为 lazy。
 - 否则尝试调用原函数，如果返回 `PrimFunc`，视为 lazy。
 - 如果调用过程中因为没有 Builder 触发 `JITNoBuilderError`，说明它是 eager-style，需要通过 AST/Builder trace。
+- eager style 的 phase1 template 会按非 tensor 编译期参数形成 `p1_key` 缓存；phase2 再从真实 tensor 参数的 shape/stride 或显式 kwargs 形成 `p2_key`，重新执行 `IRGenerator` 生成具体 PrimFunc。
 
 ---
 
@@ -941,6 +1019,8 @@ buffer(
 )
 ```
 
+如果 shape 是单个 `int` 或 `PrimExpr`，`TensorProxy` 会自动转成一维 shape。`T.StridedTensor(shape, strides, dtype)` 则要求 `len(shape) == len(strides)`，用于显式 ABI stride；这类 stride 也会参与 eager JIT 的 constexpr matcher。
+
 ### 9.2 不同 Buffer proxy 的默认 scope
 
 | Proxy | 默认 scope | 用途 |
@@ -967,6 +1047,12 @@ T.Tensor(..., T.ptr)
 
 在存储层会被规范化为 `int64`，然后通过 `T.make_tensor(...)` 或 `T.make_tensor_from_addr(...)` 把 loaded address 重新解释为 typed pointer。
 
+当前 `make_tensor` 的分支是：
+
+- 如果传入的是 `Var`，走 `Tensor.from_ptr(...)`，用 `match_buffer` 把 pointer var 绑定成 buffer。
+- 如果传入的是地址表达式，会先 `reinterpret("handle", addr)`，再 `bind(...)` 一个带 `PointerType(dtype, storage_scope)` 的指针变量。
+- `make_tensor_from_addr(...)` 明确要求在 `Builder.current()` 上下文中使用，因为它要发 TIR bind/buffer 节点。
+
 ---
 
 ## 10. `allocate.py`：内存模型与 scope 字符串
@@ -989,6 +1075,10 @@ def alloc_fragment(shape, dtype, scope="local.fragment"):
 ```
 
 三者主要区别就是 scope。
+
+当前 `alloc_shared` 对 `dtype == "bool"` 有一个特例：scope 会从默认 `shared.dyn` 改成 `shared`。原因是 shared memory merge pass 当前不能很好地 merge bool 类型 shared buffer，使用静态 shared scope 更稳。
+
+`alloc_global(shape, dtype, scope="global")` 也在当前 `T` 命名空间里。它通过 backend API 直接分配全局 workspace，主要用于测试或特殊场景；普通框架集成更推荐在 Torch 等宿主框架侧分配 workspace，再作为参数传入 kernel。
 
 | Scope | 大致硬件含义 | 生命周期/可见性 | 典型用途 |
 | --- | --- | --- | --- |
@@ -1034,22 +1124,37 @@ T.buffer_store(buffer, parsed_init, 0)
 | `alloc_barrier` | `shared.barrier` | Hopper/Blackwell mbarrier |
 | `alloc_cluster_barrier` | `shared.cluster_barrier` | cluster mbarrier |
 | `alloc_tmem` | `shared.tmem` | Blackwell Tensor Memory |
+| `alloc_reducer` | `local.fragment` + `reducer_info` attr | `T.Parallel` 内的 thread-private reducer |
 | `alloc_wgmma_desc` | `local.descriptor.wgmma` | Hopper WGMMA descriptor |
 | `alloc_tcgen05_smem_desc` | `local.descriptor.tcgen05_smem` | Blackwell smem descriptor |
 | `alloc_tcgen05_instr_desc` | `local.descriptor.tcgen05_instr` | Blackwell instruction descriptor |
 
 这些对象后续会被 specific lowering pass 或 intrinsic lowering 消费。
 
+`alloc_barrier` 和 `alloc_cluster_barrier` 不只是分配 `uint64` buffer，还会通过 `sblock_attr({"barrier_init": {buffer.data: arrive_count_exprs}})` 把 arrive count 记录到 block attr 中。后续 `LowerSharedBarrier` 这类 pass 会消费这份初始化信息。
+
+`alloc_reducer(shape, dtype, op, replication)` 会把 reducer buffer 放在 `local.fragment`，并写入 `reducer_info` metadata。`op` 当前支持 `sum/max/min`，`replication` 支持 `all/none`。它需要配合 `T.fill(...)` 初始化和 `T.finalize_reducer(...)` 使用。
+
 ### 10.4 `T.empty`
 
 `empty` 是 eager-style JIT 的输出 tensor 声明：
 
 ```python
-C = T.empty((M, N), dtype)
+C = T.empty((M, N), dtype=dtype)
 return C
 ```
 
 它不会直接分配 device memory，而是创建一个 `OutTensor` 描述，用于 JIT wrapper 在运行时准备输出 tensor，并把它映射到 PrimFunc 的输出 buffer。
+
+当前支持的调用形式包括：
+
+```python
+T.empty((M, N), dtype=dtype)
+T.empty(M, N, dtype=dtype)
+T.empty((M, N), "float16")
+```
+
+注意它只能用于 eager-style 输出声明；真正的约束在 `Builder.ret(...)`：由 `T.empty` 创建的输出必须全部被返回。
 
 ---
 
@@ -1083,6 +1188,13 @@ for i, j in T.Parallel(M, N):
 
 一个重要细节：对嵌套 parallel loop，layout annotation 应该放在最外层 parallel loop 上，因为外层才能描述整个 loop nest 的 iteration mapping。
 
+当前 `T.Parallel(..., loop_layout=layout)` 会把 layout 作为 `"parallel_loop_layout"` annotation 挂到最外层 parallel loop。`LayoutInference` 期间的 `ParallelLoopLayoutValidator` 会检查：
+
+- 嵌套 parallel loop 的 layout 必须覆盖整个 loop nest。
+- layout 的 `InputDim` 必须等于 parallel nest 深度。
+- inner parallel loop 不应该单独带 layout annotation。
+- 如果用户不传 `loop_layout`，compiler 会尝试自动推导并补上合法 layout。
+
 ### 11.2 `T.Pipelined`
 
 用户写：
@@ -1113,6 +1225,8 @@ InjectSoftwarePipeline
 
 `order/stage/sync/group` 参数用于手动 pipeline scheduling。普通阅读可以先理解 `num_stages` 自动 pipeline。
 
+当前源码里还强调一个手动调度细节：`order/stage` 应该对应真正可调度的 pipeline statements，例如 copy、fill、GEMM、reduction、store、wait/commit。由局部 alias 产生的可重放 scalar `Bind` 不应该占用 `order/stage` 条目；pipeline pass 会在需要时自动 replay 这些 bind。旧代码如果把这类 bind 算进 `order/stage`，pass 会尽量兼容并忽略它们。
+
 ### 11.3 `T.Persistent`
 
 `Persistent(domain, wave_size, index, group_size)` 表示 persistent kernel / persistent threadblock 风格。
@@ -1124,6 +1238,8 @@ InjectSoftwarePipeline
 这些是标准 TIR loop kind 的 wrapper。
 
 `loop.py` 中的 `serial/unroll` 额外支持 `step`，Builder 会把带 step 的 loop 转换成 trip count loop，再把 loop var 映射回 `start + v * step`。
+
+`T.Serial/T.Unroll/T.Vectorized` 是对应小写 API 的大写 alias。`unroll(..., unroll_factor=n)` 会把 factor 写成 `pragma_unroll_factor` annotation；`vectorized` 走 TVM/TIRX 原生 vectorized ForFrame。
 
 ---
 
@@ -1209,6 +1325,8 @@ tirx.call_intrin(
 | `prefer_instruction` | 指定偏好：`tma`、`cp_async`、`sync` 等 |
 | `loop_layout` | 给 SIMT copy 生成的 parallel loop 附 layout hint |
 
+当前实现里，显式传入的 `annotations` 字典优先级高于单独 keyword 参数。例如 `annotations={"prefer_instruction": "sync"}` 会覆盖 `prefer_instruction="tma"`。字符串形式的 `prefer_instruction` 会被转换成 `tirx.StringImm`。`loop_layout` 最终写入 annotation key `"parallel_loop_layout"`，供 SIMT copy 生成的 parallel loop 使用；它不适用于 TMA/LDSM/STSM/TMem 这类 lowering。
+
 ### 12.6 下游可能 lowering 到什么
 
 具体取决于 target、scope、shape、layout、annotation：
@@ -1227,7 +1345,8 @@ tirx.call_intrin(
 | API | 语义 |
 | --- | --- |
 | `async_copy` | 显式 async copy，通常是 cp.async 语义，不自动插 wait |
-| `tma_copy` | 用户管理 barrier 的 TMA producer 操作 |
+| `tma_copy` | 用户管理 barrier 的 TMA producer/store 操作；load 不自动 wait，store 不自动 `tma_store_wait` |
+| `tma_gather4/tma_scatter4` | Blackwell gather4/scatter4 TMA tile 操作，用 annotations 表达 rows/col/barrier |
 | `copy_cluster` | cluster-aware copy，支持 TMA multicast / SM-to-SM |
 | `transpose` | 带转置的数据搬运 |
 | `im2col/c2d_im2col` | 卷积类数据重排 |
@@ -1239,6 +1358,11 @@ tirx.call_intrin(
 文件：`tilelang/language/gemm_op.py`
 
 `T.gemm` 也是高层 tile op。Python 侧主要做参数规范化和合法性检查，真正选择 MMA/WGMMA/TCGEN05 的地方在 lowering。
+
+当前 API 可以分成两类：
+
+- `T.gemm(...)` 是默认同步接口。Hopper WGMMA 或 Blackwell TCGEN05 lowering 被选中时，compiler 会负责插入对应 wait。
+- `T.wgmma_gemm(...)` / `T.tcgen05_gemm(...)` / `T.tcgen05_gemm_blockscaled(...)` 是显式 async 接口。它们要求特定 ISA lowering，不能用时会失败，并且不会自动插入 `warpgroup_wait` 或 `mbarrier_wait_parity`。
 
 ### 13.1 统一入口 `_gemm_impl`
 
@@ -1350,10 +1474,15 @@ tirx.call_intrin(
 | `T.gemm` | `tl.tileop.gemm` | 默认同步 GEMM，高层接口 |
 | `T.wgmma_gemm` | `tl.tileop.wgmma_gemm` | Hopper WGMMA explicit async，用户管理 wait |
 | `T.tcgen05_gemm` | `tl.tileop.tcgen05_gemm` | Blackwell TCGEN05 explicit async，用户管理 mbarrier wait |
+| `T.tcgen05_gemm_blockscaled` | `tl.tileop.gemm` + scale factor args/annotations | Blackwell block-scaled TCGEN05 explicit async |
+
+`tcgen05_gemm(..., use_2cta=True)` 和 blockscaled 2CTA 模式会通过 annotation 请求 true `cta_group::2` lowering，并要求 kernel `cluster_dims` 是 `(2,1,1)` 或 `(1,2,1)`。blockscaled GEMM 还需要 SFA/SFB scale factor 已经在 TMEM 中，并要求显式传入 `mbar`。
 
 ### 13.6 `GemmWarpPolicy`
 
 `GemmWarpPolicy` 会影响 warp 如何覆盖 tile。常见策略如 square、row/column 方向展开。它不是 Python 层执行逻辑，而是传给 tile op lowering，用于 instruction/layout 选择。
+
+`make_blockscaled_gemm_layout(C, A, transpose_A=False)` 是 blockscaled 路径的辅助函数，用 A/C 的 shape 和 dtype 创建 C 的 TMEM store layout。用户需要把返回的 layout 通过 `T.annotate_layout({C_tmem: layout})` 挂到对应 buffer 上，否则后续从 TMEM copy/store 时 layout 信息不足。
 
 ---
 
@@ -1362,6 +1491,8 @@ tirx.call_intrin(
 文件：`tilelang/language/reduce_op.py`
 
 `T.reduce` 的实现很能体现 language 层的职责：它不只是发一个 intrinsic，还会根据 memory scope 自动插入中转逻辑。
+
+当前 `reduce(buffer, out, reduce_type, dim, clear, batch=1, nan_propagate=False)` 还会先检查输出 shape：`out` 必须是去掉 `dim` 后的 shape，或者保留该维但 extent 为 1。`dim < 0` 会由各个 `reduce_*` wrapper 转换成正维度。
 
 ### 14.1 reduce 为什么要 fragment 中转
 
@@ -1404,6 +1535,8 @@ def reduce_macro(...):
 
 其他 scope 组合会报错。
 
+`batch > 1` 时，Python 层会把 `"batch"` 写入 annotations，后端可以用 batched AllReduce 减少 barrier 数量。`nan_propagate=True` 只对 CUDA 上的 `max/min/absmax` 这类 float16/bfloat16 reduction 有意义，会要求 lowering 使用 NaN-propagating intrinsic。
+
 ### 14.4 `warp_reduce_*`
 
 `warp_reduce_sum/max/min/bitand/bitor` 是更低层的 register value reduction：
@@ -1413,6 +1546,8 @@ tirx.call_intrin(value.dtype, tirx.op.Op.get("tl.warp_reduce_sum"), value)
 ```
 
 它们不走 fragment 中转，语义更接近 warp shuffle intrinsic。
+
+当前 wrapper 还包括 `reduce_abssum`、`reduce_absmax`、`reduce_bitand`、`reduce_bitor`、`reduce_bitxor`。`finalize_reducer(reducer, batch=1)` 会发射 `tl.tileop.finalize_reducer`，通常和 `alloc_reducer` 配合使用，把 `T.Parallel` 内部累积的 per-thread partial results 做最终归并。
 
 ---
 
@@ -1553,6 +1688,8 @@ evaluate(...)
 parse(func, utils.inspect_function_capture(func), check_well_formed=...)
 ```
 
+注意当前 `tilelang/language/__init__.py` 中 `T.prim_func` 最后会被 `.eager` 导入覆盖，所以主路径是 `eager/builder.py` 的 `prim_func`。这里的 `tir/entry.py` 更适合作为 TVM script parser 兼容入口来读，而不是当前 eager/lazy JIT 主线的入口。
+
 `tir/ir.py` 重新导出或包了一批 TIR 表达式/loop 工具，如：
 
 - `serial`
@@ -1576,7 +1713,7 @@ parse(func, utils.inspect_function_capture(func), check_well_formed=...)
 - `parser.py`：对 TVM script parser visit 方法的注册/扩展
 - `operation.py`：parser 操作支持
 
-当前 `language/__init__.py` 中已经直接导入 `tvm.tirx.script.parser`，并有注释说明希望未来完全兼容 upstream，所以这块不是初学主线。
+当前 `language/__init__.py` 中已经直接导入 `tvm.tirx.script.parser`，并有注释说明希望未来完全兼容 upstream；同时 `.eager` 导入覆盖了主命名空间里的 `prim_func/macro/const` 等 eager 入口。所以 `parser/` 不是初学主线，更多是历史兼容和 TVM script 扩展背景。
 
 ### 19.3 `overrides/`
 
@@ -1672,6 +1809,12 @@ LowerTileOp
 `LayoutInference` 推导 fragment/shared/parallel loop layout。
 
 `LowerTileOp` 把 `tl.tileop.copy/gemm/reduce` 等高层 op 降成低层 TIR/intrinsic。
+
+当前 CUDA pipeline 的重要分界是：
+
+- `ProducerConsumerWarpSpecialized`、`LowerBlackwell2SM`、`PipelinePlanning`、`InjectSoftwarePipeline` 都在 `LayoutInference` 前运行，让 layout inference 看到较最终的高层结构。
+- `LowerTileOp` 之后才进入更偏存储/代码形态的 pass，例如 TMEM/barrier lowering、allocation placement、buffer flatten、vectorize、storage rewrite、host/device split。
+- `LowerTileOp` 会设置类似 `tl.has_tma` 的函数 attr，后续 pipeline 会据此决定是否运行 `FuseMBarrierArriveExpectTx` 等 TMA 相关处理。
 
 ### 20.3 C++ `LowerTileOp`
 
@@ -1870,11 +2013,15 @@ T.copy(A_tile, A_s, prefer_instruction="tma")
 | `frame.py` | let value 和 BufferRegion alias 追踪 | 中高 |
 | `annotations.py` | 编译 hint 注入 | 中 |
 | `warpgroup.py` | warp specialization scope | 中 |
+| `fill_op.py` / `scan_op.py` | fill/clear、prefix scan 类 TileOp | 中 |
+| `print_op.py` | device-side print/assert wrapper | 中低 |
 | `builtin.py` | 底层 GPU intrinsic wrapper | 中低，后读 |
 | `math_intrinsics.py` / `fastmath.py` | 数学 intrinsic wrapper | 中低 |
 | `customize.py` / `atomic.py` | atomic、reshape/view、定制 intrinsic | 中低 |
 | `cluster.py` | cluster barrier/cancel/query API | 中低 |
 | `pdl.py` | PDL trigger/sync API | 中低 |
+| `dtypes.py` / `symbolics.py` / `random.py` | dtype 对象、dynamic/symbolic marker、随机数 API | 中低 |
+| `experimental/` | sparse GEMM 等实验性 TileOp | 中低 |
 | `tir/` | TVM/TIR wrapper 和 parser entry | 中 |
 | `parser/` | TVM script parser 兼容/扩展 | 中低 |
 | `overrides/` | parser/buffer 行为补丁 | 中低 |
@@ -1913,11 +2060,11 @@ T.copy(A_tile, A_s, prefer_instruction="tma")
 
 ---
 
-## 27. `KernelLaunchFrame`、`TIRFrame`、`FrameStack` 问答补充
+## 附录 A. `KernelLaunchFrame`、`TIRFrame`、`FrameStack` 问答补充
 
-这一章记录一次围绕 `tilelang/language/kernel.py` 的源码阅读问题，重点解释几个容易混淆的概念：`TIRFrame`、`KernelLaunchFrame`、`FrameStack`、`self.frames`、`SBlockFrame` 和 Python slice 语义。
+这个附录记录一次围绕 `tilelang/language/kernel.py` 的源码阅读问题，重点解释几个容易混淆的概念：`TIRFrame`、`KernelLaunchFrame`、`FrameStack`、`self.frames`、`SBlockFrame` 和 Python slice 语义。
 
-### 27.1 `TIRFrame` 是什么
+### A.1 `TIRFrame` 是什么
 
 `TIRFrame` 可以理解成 TVM/TIRX script builder 里的“语法作用域帧”。
 
@@ -1944,7 +2091,7 @@ with T.Kernel(...) as bx:
 
 最终真正留下来并被 lowering/codegen 使用的是 TIR tree，例如 `For`、`Block`、`SeqStmt`、`AttrStmt`、`PrimFunc` 等。`TIRFrame` / `KernelLaunchFrame` 本身更像构造期脚手架，构造出 TIR tree 之后，语义上就不需要继续参与运行时执行。
 
-### 27.2 `KernelLaunchFrame` 是什么
+### A.2 `KernelLaunchFrame` 是什么
 
 `KernelLaunchFrame` 是 TileLang 为 `T.Kernel(...)` 定制的一个 `TIRFrame` 子类：
 
@@ -1977,7 +2124,7 @@ KernelLaunchFrame
 
 更精确地说：`KernelLaunchFrame` 不是“把 kernel body 里所有嵌套 TIRFrame 都平铺保存起来”的对象，而是一个表示 kernel launch 外壳的复合 frame。它的 `self.frames` 是这个 launch 的直接组成部分：block/thread 绑定，以及承载 body 的 `SBlockFrame`。
 
-### 27.3 `FrameStack` 和 `self.frames` 不是一回事
+### A.3 `FrameStack` 和 `self.frames` 不是一回事
 
 `kernel.py` 里定义的 `FrameStack` 是 TileLang 自己写的一个小栈，本质是 `deque` 包装：
 
@@ -2030,7 +2177,7 @@ self.frames:
     是当前 frame 的 launch 骨架结构
 ```
 
-### 27.4 为什么 `__exit__` 要判断 `stack.top() is self`
+### A.4 为什么 `__exit__` 要判断 `stack.top() is self`
 
 正常情况下，`with T.Kernel(...)` 的进入和退出是严格配对的：
 
@@ -2050,7 +2197,7 @@ if stack.top() is self:
 
 这里用 `is` 而不是 `==`，是因为要比较对象身份：退出哪个 `with`，就只能清理同一个 `KernelLaunchFrame` 实例。
 
-### 27.5 `SBlockFrame` 为什么不展开成 x/y/z 三维
+### A.5 `SBlockFrame` 为什么不展开成 x/y/z 三维
 
 这里最容易混淆的是两个 “block” 不是一个概念。
 
@@ -2091,7 +2238,7 @@ maybe_cpu = last_block_frame.annotations.get("tilelang.is_cpu_kernel_frame", Fal
 
 例如 CPU kernel 标记、`pragma_import_c`、`cluster_dims` 这类信息都挂在这个 block scope 上。
 
-### 27.6 `get_block_bindings()` 取的是什么
+### A.6 `get_block_bindings()` 取的是什么
 
 `get_block_bindings()` 的实现是：
 
@@ -2146,7 +2293,7 @@ frames[-4:]
 
 所以 `get_block_bindings()` 用 `self.frames[0:-4]` 是为了取 block binding，而不是取最后 4 个。
 
-### 27.7 `get_thread_bindings()` 为什么是 `self.frames[-4:-1]`
+### A.7 `get_thread_bindings()` 为什么是 `self.frames[-4:-1]`
 
 `get_thread_bindings()` 的实现是：
 
@@ -2186,7 +2333,7 @@ dim = 1 -> self.frames[-3] -> threadIdx.y
 dim = 2 -> self.frames[-2] -> threadIdx.z
 ```
 
-### 27.8 `with T.Kernel(...) as ...` 返回 block binding
+### A.8 `with T.Kernel(...) as ...` 返回 block binding
 
 GPU 情况下，`KernelLaunchFrame.__enter__` 返回的是 block binding，而不是 thread binding：
 
@@ -2224,7 +2371,7 @@ with T.Kernel(n, threads=128) as (bx,):
     ...
 ```
 
-### 27.9 CPU kernel 的特殊路径
+### A.9 CPU kernel 的特殊路径
 
 GPU kernel 的 frame 末尾约定是 `threadIdx.x/y/z + SBlockFrame`，所以 block binding 用 `self.frames[0:-4]`。
 
@@ -2239,7 +2386,7 @@ if maybe_cpu:
 
 这也解释了为什么 GPU 和 CPU 分支切片不同：GPU 多了三个 thread binding frame。
 
-### 27.10 最终心智模型
+### A.10 最终心智模型
 
 可以把这组关系压缩成一张图：
 
@@ -2273,9 +2420,9 @@ TIRFrame / KernelLaunchFrame 是构造 TIR 时的辅助结构，最终产物是 
 
 ---
 
-## 28. `register_object`、`_ffi_api` 和 C++ FFI 绑定顺序
+## 附录 B. `register_object`、`_ffi_api` 和 C++ FFI 绑定顺序
 
-这一章补充 `tilelang/language/kernel.py` 里的这一行：
+这个附录补充 `tilelang/language/kernel.py` 里的这一行：
 
 ```python
 @register_object("tl.KernelLaunchFrame")
@@ -2285,7 +2432,7 @@ class KernelLaunchFrame(TIRFrame):
 
 问题的核心是：`register_object` 不是 Python 标准库里的东西，而是 TVM/TVM-FFI 提供的 Python-C++ 对象系统注册接口。它负责把 C++ 侧的 FFI object type key，绑定到 Python 侧的包装类。
 
-### 28.1 `register_object` 来自哪里
+### B.1 `register_object` 来自哪里
 
 `kernel.py` 里写的是：
 
@@ -2329,7 +2476,7 @@ def register_object(type_key: str | None = None, *, init: bool = True):
 
 如果 C++ 侧没有先注册 `"tl.KernelLaunchFrame"`，这里会找不到 object type index，然后报错。
 
-### 28.2 C++ 侧如何声明这个对象类型
+### B.2 C++ 侧如何声明这个对象类型
 
 C++ 侧对应代码在 `src/ir.cc`：
 
@@ -2363,7 +2510,7 @@ TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.KernelLaunchFrame", ...)
 
 所以 Python 和 C++ 不是靠文件名、类名自动匹配，而是靠这个 type key 字符串精确关联。
 
-### 28.3 `KernelLaunch` 函数如何暴露给 Python
+### B.3 `KernelLaunch` 函数如何暴露给 Python
 
 对象类型注册是一条线，函数注册是另一条线。
 
@@ -2411,7 +2558,7 @@ TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.KernelLaunchFrame", ...)
     注册对象类型映射，让 C++ 返回的对象能包装成 Python KernelLaunchFrame
 ```
 
-### 28.4 `_ffi_api.py` 怎么把 C++ 函数变成 Python 函数
+### B.4 `_ffi_api.py` 怎么把 C++ 函数变成 Python 函数
 
 TileLang 有一个很小的文件：
 
@@ -2469,7 +2616,7 @@ return _ffi_api.KernelLaunch(blocks, threads, attrs)
 
 本质上是在调用 C++ 注册的 `tl.KernelLaunch`。
 
-### 28.5 import 顺序：从 `import tilelang` 到 `T.Kernel(...)`
+### B.5 import 顺序：从 `import tilelang` 到 `T.Kernel(...)`
 
 一次典型 import 的顺序可以理解成：
 
@@ -2506,7 +2653,7 @@ return _ffi_api.KernelLaunch(blocks, threads, attrs)
 
 这里的关键顺序是：动态库必须先加载，C++ 侧的 `tl.*` 函数和 object type key 才会出现在 FFI registry 里。然后 Python 的 `_ffi_api` 和 `register_object` 才能根据这些已注册信息进行绑定。
 
-### 28.6 当用户写 `with T.Kernel(...)` 时发生什么
+### B.6 当用户写 `with T.Kernel(...)` 时发生什么
 
 完整调用链可以压缩成：
 
@@ -2550,7 +2697,7 @@ Python with 语义
 从而拥有 Python 侧定义的 __enter__ / __exit__ / get_thread_binding 等行为。
 ```
 
-### 28.7 两种 registry 的心智模型
+### B.7 两种 registry 的心智模型
 
 最后可以把这套机制拆成两张 registry 表：
 
@@ -2582,14 +2729,14 @@ Python DSL 函数很薄
     -> Python register_object 提供包装类和便捷方法
 ```
 
-## 29. `@tilelang.jit`、AST、IRGenerator 补充问答
+## 附录 C. `@tilelang.jit`、AST、IRGenerator 补充问答
 
-这一章整理两个常见追问：
+这个附录整理两个常见追问：
 
 1. `@tilelang.jit` 到底怎么运作，跟 `tilelang/language/` 目录相关的调用链是什么。
 2. Python AST、`IRGenerator`、`IRBuilder` 分别是什么，它们之间是什么关系。
 
-### 29.1 `@tilelang.jit` 的职责
+### C.1 `@tilelang.jit` 的职责
 
 `@tilelang.jit` 自己不是 parser，也不是 IR builder。它更像一个 **JIT 包装层**：
 
@@ -2605,7 +2752,7 @@ Python DSL 函数很薄
 tilelang/language/eager 负责把 Python DSL 变成 PrimFunc。
 ```
 
-### 29.2 装饰阶段的调用链
+### C.2 装饰阶段的调用链
 
 当用户写：
 
@@ -2630,7 +2777,7 @@ tilelang.jit.jit(...)
 - `mutate(func)` 会把原始 Python 函数的 AST 改写成一个 IR 生成函数。
 - `prim_func(..., eager_jit=True)` 这一步不会立刻生成 `PrimFunc`，而是先返回 `JITFunc`，把真正的 IR 构建延迟到函数第一次调用时。
 
-### 29.3 调用阶段：先判定 lazy/eager，再生成 PrimFunc
+### C.3 调用阶段：先判定 lazy/eager，再生成 PrimFunc
 
 当用户第一次调用 `foo(...)` 时，主链路是：
 
@@ -2701,7 +2848,7 @@ phase2
 
 所以 eager 模式下，用户函数体其实会被“以构造 IR 的方式执行两次”，而不是按普通 Python 运行时语义执行一次。
 
-### 29.4 跟 `tilelang/language/` 目录最相关的调用链
+### C.4 跟 `tilelang/language/` 目录最相关的调用链
 
 如果只保留语言层相关模块，可以把主链总结成：
 
@@ -2736,7 +2883,7 @@ with T.Kernel(...)
 - `eager/ast.py` 负责把 Python 语法改写成 Builder 调用
 - `eager/builder.py` 负责把这些调用落成真实 TIR/TIRX IR
 
-### 29.5 Python AST 是什么
+### C.5 Python AST 是什么
 
 AST 是 Abstract Syntax Tree，抽象语法树。  
 它表示的是“这段 Python 代码的结构”，不是执行结果。
@@ -2770,7 +2917,7 @@ tilelang.language.eager.ast.mutate(func)
 - 把这些 Python 语句改写成对 `Builder` 的调用
 - 让原本看起来像 Python 的 DSL 代码，最终变成“构建 IR 的 Python 代码”
 
-### 29.6 `IRGenerator` 是什么
+### C.6 `IRGenerator` 是什么
 
 `IRGenerator` 不是 IR，也不是 builder。  
 它是 AST 改写之后得到的一个 **IR 生成器包装对象**。
@@ -2802,7 +2949,7 @@ IRGenerator(
 - 延迟到真正构建 IR 时再执行
 - 执行时把语句导向 `Builder`
 
-### 29.7 `IRBuilder` 是什么
+### C.7 `IRBuilder` 是什么
 
 `IRBuilder` 是更底层的 TVM/TIRX IR 构造器。  
 TileLang 的 `Builder` 内部持有它：
@@ -2824,7 +2971,7 @@ Builder
 - `IRGenerator`：AST 改写后的“生成函数包装器”
 - `IRBuilder`：底层真实的 IR 构造器
 
-### 29.8 `IRBuilder` 接收的是 `IRGenerator` 吗
+### C.8 `IRBuilder` 接收的是 `IRGenerator` 吗
 
 不是。
 
@@ -2856,7 +3003,7 @@ IRBuilder(IRGenerator)
 IRGenerator --执行--> Builder --使用--> IRBuilder
 ```
 
-### 29.9 一个最短心智模型
+### C.9 一个最短心智模型
 
 如果只记一句话，记这个：
 

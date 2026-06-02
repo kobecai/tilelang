@@ -9,6 +9,7 @@
 - [2.1 核心精髓：两种 JIT 风格与 AST 改写](#21-核心精髓两种-jit-风格与-ast-改写)
 - [3. 从用户代码到 CUDA/HIP/CPU 的整体数据流](#3-从用户代码到-cudahipcpu-的整体数据流)
 - [4. 推荐阅读顺序](#4-推荐阅读顺序)
+- [4.1 初读者三遍阅读法：从 API 到 IR 再到 pass](#41-初读者三遍阅读法从-api-到-ir-再到-pass)
 - [5. `__init__.py`：`T` 命名空间的总菜单](#5-__init__pyt-命名空间的总菜单)
 - [6. `kernel.py`：`T.Kernel` 与 launch frame 机制](#6-kernelpytkernel-与-launch-frame-机制)
 - [7. `eager/ast.py`：Python AST 如何变成 Builder 调用](#7-eagerastpypython-ast-如何变成-builder-调用)
@@ -429,6 +430,115 @@ tilelang.lower(...)
 13. tilelang/cuda/pipeline.py + src/transform/lower_tile_op.cc
     跳出 language，看高层 tile op 如何真正兑现
 ```
+
+## 4.1 初读者三遍阅读法：从 API 到 IR 再到 pass
+
+如果第一次打开 `tilelang/language/`，最容易被文件数量劝退。不要一开始逐文件顺序读，也不要先钻进 `builtin.py`、`cluster.py`、`tcgen05` 这类硬件细节。更稳的方式是围绕一个真实 kernel，分三遍读。
+
+### 第一遍：把 `T` 命名空间分成 5 类
+
+先读 `__init__.py`，目标不是记住所有 API，而是把它们分成几类：
+
+| 类别 | 代表 API | 阅读时问什么 |
+| --- | --- | --- |
+| frame / scope 构造 | `T.Kernel`、`T.Parallel`、`T.Pipelined`、`T.ws` | 它进入了什么 TIR frame？退出时会留下什么 IR 结构？ |
+| buffer / tensor 构造 | `T.Tensor`、`T.alloc_shared`、`T.alloc_fragment`、`T.alloc_var`、`T.empty` | 它创建的是函数参数、临时 buffer、fragment，还是 eager 输出？scope 是什么？ |
+| 高层 TileOp | `T.copy`、`T.gemm`、`T.reduce`、`T.clear`、`T.cumsum` | 它生成了哪个 `tl.tileop.*`？shape/region/annotation 怎么编码？ |
+| metadata / annotation | `T.annotate_layout`、`T.use_swizzle`、`T.annotate_l2_hit_ratio` | 它不生成计算代码，而是给哪个 pass 留 hint？ |
+| 低层 intrinsic wrapper | `T.sync_threads`、`T.warpgroup_wait`、`T.mbarrier_*`、`T.__ldg` | 它是直接发 `call_intrin/call_extern`，还是仍保留高层语义？ |
+
+读完第一遍，应该能回答一个问题：**这个 API 是用户级 DSL、高层 TileOp，还是底层 intrinsic 包装？**
+
+这一步最重要，因为 `language/` 里很多文件看起来都在“定义函数”，但函数的层级完全不同。`T.copy` 和 `T.sync_threads` 都是 Python 函数，但前者保留高层数据搬运语义，后者更接近直接插入底层同步 intrinsic；`T.Kernel` 和 `T.alloc_shared` 也都是 Python 函数，但前者构造 launch frame，后者构造带 scope 的 buffer。
+
+### 第二遍：跟一条最小 GEMM 路径
+
+第二遍建议拿 [examples/quickstart.py](examples/quickstart.py) 或一个最小 matmul kernel，对照以下调用链读：
+
+```text
+@tilelang.jit / @T.prim_func
+    -> eager/ast.py 把 Python 语法改写成 Builder 调用
+    -> eager/builder.py 执行改写后的函数并构造 PrimFunc
+    -> proxy.py 处理 T.Tensor / T.empty
+    -> kernel.py 处理 T.Kernel launch frame
+    -> allocate.py 处理 shared/local/fragment allocation
+    -> loop.py 处理 T.Pipelined / T.Parallel metadata
+    -> copy_op.py 生成 tl.tileop.copy
+    -> gemm_op.py 生成 tl.tileop.gemm
+    -> reduce_op.py / fill_op.py 等按需生成其他 tile op 或 macro 展开
+```
+
+这一遍的阅读重点不是把每个函数内部都读完，而是每碰到一行 DSL 就追问：
+
+```text
+这行 DSL 最终往 PrimFunc 里放了什么？
+```
+
+例如：
+
+| 用户 DSL | language 层留下的东西 |
+| --- | --- |
+| `A: T.Tensor((M, K), dtype)` | global scope 的 TIR Buffer 参数，带 shape/stride/dtype |
+| `with T.Kernel(...) as (bx, by)` | launch-thread frames + `tilelang_root` block attrs |
+| `T.alloc_shared((BM, BK), dtype)` | `sblock_alloc_buffer(..., scope="shared.dyn")` |
+| `T.alloc_fragment((BM, BN), dtype)` | `sblock_alloc_buffer(..., scope="local.fragment")` |
+| `for ko in T.Pipelined(..., num_stages=3)` | 带 software pipeline metadata 的 loop frame |
+| `T.copy(A_tile, A_shared)` | `tl.tileop.copy` call，参数是 legalized BufferRegion |
+| `T.gemm(A_shared, B_shared, C_frag)` | `tl.tileop.gemm` call，参数包含 M/N/K、stride、offset、policy |
+
+这一遍读完，你不一定知道 CUDA 最后生成了哪条 PTX，但应该知道：**`language/` 的产物是一棵带 TileLang 高层语义的 TIR/TIRX tree。**
+
+### 第三遍：从高层语义反查下游 pass
+
+第三遍再跳出 `language/`，去看这些语义在哪里被消费：
+
+| language 层语义 | 主要消费位置 | 关注点 |
+| --- | --- | --- |
+| `scope="shared.dyn"` / `scope="local.fragment"` | `LayoutInference`、`LowerTileOp`、`StorageRewrite` | shared/fragment 如何参与 layout、memory planning、copy/gemm lowering |
+| `tl.tileop.copy` | `src/transform/lower_tile_op.cc` + backend copy op | 何时变成 TMA、cp.async、ldmatrix、SIMT copy、vectorized store |
+| `tl.tileop.gemm` | `src/transform/lower_tile_op.cc` + CUDA/ROCm GEMM op | 何时选择 MMA、WGMMA、TCGEN05、MFMA |
+| `T.Pipelined` metadata | backend pipeline 的 `PipelinePlanning` / `InjectSoftwarePipeline` | producer/consumer 怎么被重排，barrier/wait/commit 怎么插入 |
+| `parallel_loop_layout` / `layout_map` | `LayoutInference` | fragment element 到 thread/lane 的映射如何确定 |
+| `T.ws(...)` | `ProducerConsumerWarpSpecialized` | warp group producer/consumer 结构如何被改写 |
+| barrier/tmem/descriptor allocation | `LowerSharedBarrier`、`LowerSharedTmem`、Hopper/Blackwell intrinsic lowering | 高层 allocation 如何变成具体硬件同步和 descriptor |
+
+这一遍的阅读习惯是反向的：看到 `copy_op.py` 里发了 `tl.tileop.copy`，就去 `LowerTileOp` 里搜 `tileop.copy`；看到 `allocate.py` 里用了 `local.fragment`，就去 `LayoutInference` 和 `InferFragment` 看 fragment 怎么被解释；看到 `loop.py` 里 `T.Pipelined` 写了 `num_stages`，就去 pipeline pass 看它如何展开。
+
+### 不同目标下的阅读入口
+
+同一套 `language/` 前端会服务多个 backend。读源码时可以按目标硬件选择下游入口：
+
+| 目标 | 先读 language 文件 | 再读下游文件 |
+| --- | --- | --- |
+| 普通 DSL / 入门 | `kernel.py`、`proxy.py`、`allocate.py`、`loop.py` | `tilelang/engine/lower.py` |
+| 数据搬运 / copy | `copy_op.py` | `src/transform/lower_tile_op.cc`、backend copy op |
+| GEMM / Tensor Core | `gemm_op.py`、`allocate.py`、`annotations.py` | `src/transform/lower_tile_op.cc`、`tilelang/cuda/op/gemm/`、`src/backend/cuda/op/gemm.cc` |
+| software pipeline | `loop.py`、`copy_op.py`、`gemm_op.py` | `tilelang/cuda/pipeline.py`、pipeline planning / inject software pipeline pass |
+| Hopper WGMMA / TMA | `copy_op.py`、`gemm_op.py`、`warpgroup.py`、`builtin.py` | CUDA pipeline、Hopper intrinsic lowering |
+| Blackwell TCGEN05 / TMEM | `allocate.py`、`gemm_op.py`、`builtin.py` | `LowerBlackwell2SM`、`LowerSharedTmem`、`InjectTcgen05Fence` |
+| runtime / JIT 入口 | `eager/ast.py`、`eager/builder.py` | `tilelang/jit/*`、`tilelang/engine/lower.py` |
+
+### 一句话检查自己是否读懂
+
+每读完一个文件，尝试用下面这个模板复述：
+
+```text
+这个文件暴露给用户的 API 是 ...
+它在 Python 执行时不会做 ...
+它会往 IR 里放 ...
+这些 IR/metadata 后续主要由 ... pass 消费。
+```
+
+例如 `copy_op.py` 可以复述为：
+
+```text
+copy_op.py 暴露 T.copy/T.async_copy/T.tma_copy 等数据搬运 API。
+它在 Python 执行时不会真的复制数据。
+它会把 src/dst 规范化成 BufferRegion，并发出 tl.tileop.copy 或特定 copy intrinsic。
+这些节点后续主要由 LayoutInference、LowerTileOp 和 backend copy lowering 消费。
+```
+
+这种复述比记函数名更重要。只要能稳定说清“这个文件留下什么 IR 语义、谁消费它”，`language/` 目录就会从一堆 API 变成一条可追踪的编译链路。
 
 ---
 

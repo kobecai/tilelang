@@ -1737,41 +1737,336 @@ parse(func, utils.inspect_function_capture(func), check_well_formed=...)
 
 ### 20.1 `tilelang/engine/lower.py`
 
-`lower_to_host_device_ir(...)` 做：
+文件：`tilelang/engine/lower.py`
 
-1. 如果输入是 `PrimFunc`，包成 `IRModule`。
-2. 解析 target 和 target_host。
-3. 跑 `PreLowerSemanticCheck`。
-4. 根据 target 选择 backend pipeline：
+这个文件是 frontend 生成的高层 TIR/TIRX 和 backend pass/codegen 之间的总入口。它本身不展开 CUDA/HIP/Metal 的具体 lowering 规则，而是做几件边界工作：规范输入、解析 target、跑 backend-independent 检查、选择 backend pipeline、拆 host/device module，最后可选地接 codegen。
+
+#### 20.1.1 输入规范化与参数提取
+
+主入口之一是：
+
+```python
+def lower_to_host_device_ir(
+    func_or_mod,
+    target="auto",
+    target_host=None,
+    runtime_only=False,
+):
+```
+
+它既接受单个 `tirx.PrimFunc`，也接受已经打包好的 `IRModule`。
+
+如果传入的是 `PrimFunc`，会先做两件事：
+
+```python
+params = extrac_params(func) if not runtime_only else None
+mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+```
+
+`extrac_params` 会遍历 `func.params`：
+
+- 参数在 `func.buffer_map` 中时，说明它是 tensor/buffer 参数，用 `KernelParam.from_buffer(...)` 记录 shape、dtype、scope 等 ABI 信息。
+- 否则它是普通 scalar 变量，用 `KernelParam.from_var(...)` 记录。
+- `runtime_only=True` 时不提取这些 Python 侧调用参数信息。
+
+所以这里的第一层意义是：把“一个 DSL 生成的 kernel 函数”统一变成后端 pass 能处理的 `IRModule`，同时保留 JIT/runtime 需要的参数描述。
+
+#### 20.1.2 target / target_host 解析
+
+接下来是 target 规范化：
+
+```python
+if isinstance(target, str):
+    target = determine_target(target)
+
+target_host = canon_target_host(target, target_host)
+target_host = tvm.target.Target(target_host)
+target = tvm.target.Target(target, target_host)
+```
+
+`target="auto"` 这类字符串会先经过 `determine_target(...)` 解析成具体 TVM target。`target_host` 如果没指定，默认优先用 `llvm`，没有 LLVM runtime 时退到 `c`：
+
+```python
+target_host = "llvm" if tvm.runtime.enabled("llvm") else "c"
+```
+
+最后 `tvm.target.Target(target, target_host)` 会把 host target 绑到 device target 上。后续 backend pipeline 和 codegen 都依赖这个规范化后的 `Target` 对象，而不是原始字符串。
+
+#### 20.1.3 host/device 函数如何区分
+
+`lower.py` 里有一组小函数专门判断一个 `PrimFunc` 属于 host 还是 device：
+
+```python
+has_device_kernel_launch(attrs)
+is_device_call(func)
+is_device_call_c_device(func)
+get_device_call(...)
+get_host_call(...)
+```
+
+GPU target 下，device kernel 主要看函数 attr：
+
+```python
+attrs["calling_conv"] == CallingConv.DEVICE_KERNEL_LAUNCH
+```
+
+CPU/C backend 比较特殊：`is_device_call_c_device` 还会把 target kind 为 `c`、且不是 `C_PACKED_FUNC` 的函数视作 device-side 代码。这样同一套 split/filter 逻辑也能服务 CPU-style target。
+
+pipeline 跑完后，真正拆分发生在：
+
+```python
+host_mod = tirx.transform.Filter(_is_host_call)(mod)
+device_mod = tirx.transform.Filter(_is_device_call)(mod)
+```
+
+注意：各 backend pipeline 内部通常已经跑过 `AnnotateDeviceRegions()`、`SplitHostDevice()`、`LowerDeviceKernelLaunch()` 等 pass；`lower.py` 这里的 `Filter` 是按 calling convention/target attr 把同一个 lowered module 分成 host 和 device 两份，供后续 codegen 或 JIT 使用。
+
+#### 20.1.4 semantic check 与 backend pipeline 选择
+
+真正进入 backend 前，会先跑 target-independent 的语义检查：
+
+```python
+PreLowerSemanticCheck(mod)
+```
+
+这一步适合放不依赖 CUDA/HIP/Metal 具体实现的 DSL 合法性检查。通过后才选择 backend pipeline：
 
 ```python
 pipeline = resolve_pipeline(target)
 mod = pipeline.lower(mod, target)
 ```
 
-5. split host/device IRModule。
+`resolve_pipeline(target)` 的实现很薄：按 `target.kind.name` 从 registry 里取 `PassPipeline`。各 backend 在自己的 `pipeline.py` 里注册：
 
-### 20.2 CUDA pipeline 的核心片段
+| Target kind | 注册位置 | 主要阅读入口 |
+| --- | --- | --- |
+| `cuda` | `tilelang/cuda/pipeline.py` | CUDA pass 顺序、TMA/WGMMA/TCGEN05、CUDA-only transform |
+| `hip` | `tilelang/rocm/pipeline.py` | ROCm/HIP pass 顺序、MFMA/WMMA lowering |
+| `metal` | `tilelang/metal/pipeline.py` | Metal pass 顺序、simdgroup fragment 处理 |
+| `c` / `llvm` | `tilelang/cpu/pipeline.py` | CPU pass 顺序、scalar tile-op lowering |
+| `webgpu` | `tilelang/backend/common.py` | 临时复用 CPU pipeline 的 common 注册 |
+
+所以 `lower.py` 的角色不是“知道每个 backend 怎么降级”，而是“根据 target.kind.name 找到该 backend 拥有的 pass 序列”。
+
+#### 20.1.5 device / host codegen
+
+另一个入口 `lower(...)` 会在 `lower_to_host_device_ir(...)` 之后继续做 codegen：
+
+```python
+codegen_mod = (
+    device_codegen(device_mod, target)
+    if enable_device_compile
+    else device_codegen_without_compile(device_mod, target)
+)
+kernel_source = codegen_mod.inspect_source()
+```
+
+默认 `enable_device_compile=False`，所以一般先走 `device_codegen_without_compile(...)`，拿到可 inspect 的 kernel source；真正编译 cubin/hsaco 由 JIT 侧按需要处理。
+
+device codegen 前有一段 backend-shared 清理：
+
+```python
+device_mod = tilelang.transform.LowerIntrin()(device_mod)
+device_mod = tirx.transform.Simplify()(device_mod)
+device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
+```
+
+然后根据 target 分发到注册在 TVM FFI 里的 codegen：
+
+| Target | compile codegen | without compile codegen |
+| --- | --- | --- |
+| CUDA | `target.build.tilelang_cuda` / `target.build.tilelang_cutedsl` | `target.build.tilelang_cuda_without_compile` / `target.build.tilelang_cutedsl_without_compile` |
+| HIP | `target.build.tilelang_hip` | `target.build.tilelang_hip_without_compile` |
+| Metal | `target.build.tilelang_metal` | `target.build.tilelang_metal` |
+| C/LLVM/WebGPU | 不走 `device_codegen(...)` | `target.build.tilelang_c` / `target.build.llvm` / `target.build.webgpu` |
+
+host codegen 在 `enable_host_codegen=True` 时才跑。它会对 host module 做 `BindTarget`、FP8/BF16 storage legalize、`LowerTVMBuiltin`、`LowerCustomDatatypes`、`LowerIntrin`，Metal target 还会额外 `MarkHostMetalContext`。最后：
+
+- `target_host == llvm` 时调用 `target.build.llvm`
+- `target_host == c` 时调用 `target.build.tilelang_c_host`
+
+默认不启用 host codegen，因为注释里说 JIT 有自己的 host codegen 实现。
+
+#### 20.1.6 CUDA/HIP 编译回调和外部 CUDA kernel 校验
+
+文件顶部注册了几个 FFI callback：
+
+```python
+tilelang_callback_cuda_validate
+tilelang_callback_cuda_compile
+tilelang_callback_hip_compile
+```
+
+`tilelang_callback_cuda_compile` 用 `nvcc.compile_cuda(...)` 把 CUDA source 编成 cubin：
+
+- 架构来自 target compute capability。
+- 默认用 `-std=c++20`，因为模板里的 CUDA reduce helper 用到了 C++20 lambda template parameter。
+- include `TILELANG_TEMPLATE_PATH` 和 `CUTLASS_INCLUDE_DIR`。
+- pass config 可以控制 `--use_fast_math`、额外 device compile flags、ptxas register usage level、ptxas verbose 输出。
+
+`tilelang_callback_hip_compile` 类似，但走 `hipcc.compile_hip(...)`，输出 `hsaco`，并 include composable kernel 目录。
+
+`tilelang_callback_cuda_validate` 是给 `T.CUDASourceCodeKernel` 这类外部 CUDA source kernel 用的：它会检查 `code_block_source` 里确实声明了 `__global__` kernel，并且 kernel 名要和 lowered `global_symbol` / `code_block_entry_name` 对齐。也就是说，用户直接塞 CUDA 源码时，`lower.py` 会在进入 CUDA codegen 前做入口名一致性保护。
+
+#### 20.1.7 `lower.py` 和 backend 目录的阅读关系
+
+回答一个常见阅读问题：研究不同 backend，确实主要看不同 backend 目录。
+
+推荐跳转方式是：
+
+```text
+tilelang/engine/lower.py
+  -> resolve_pipeline(target)
+  -> tilelang/<backend>/pipeline.py
+  -> tilelang/<backend>/op/ 或 intrinsics/ 或 transform/
+  -> src/backend/<backend>/ 和 src/transform/ 中对应 C++ pass/codegen
+```
+
+比如看 CUDA，就从下一节 `tilelang/cuda/pipeline.py` 的 pass 顺序开始；看到 `LowerTileOp` 时，再跳到 `src/transform/lower_tile_op.cc` 以及 `tilelang/cuda/op/`、`tilelang/cuda/intrinsics/` 里看 GEMM/copy/reduce 最终怎么选 MMA、WGMMA、TCGEN05、TMA/cp.async 等路径。
+
+ROCm/HIP、Metal、CPU 也是同样路线：先看对应 `pipeline.py`，再看该 backend 自己的 `op/`、`intrinsics/`、`transform/` 和 `src/backend/<backend>/`。共同 pass 或跨 backend pass 则通常在 `tilelang/transform/` 与 `src/transform/`。
+
+### 20.2 `tilelang/cuda/pipeline.py`：CUDA pass pipeline 分段解读
 
 文件：`tilelang/cuda/pipeline.py`
 
-核心顺序大致是：
+CUDA pipeline 是 `lower.py` 里 `resolve_pipeline(target)` 最终拿到的 backend pass 序列。文件末尾注册：
+
+```python
+cuda_pipeline = PassPipeline("cuda", CUDAPassPipelineBody)
+register_pipeline(cuda_pipeline)
+```
+
+所以当 `target.kind.name == "cuda"` 时，真正执行的是 `CUDAPassPipelineBody(mod, target)`。
+
+这个文件可以按三层读：
+
+1. 顶部 helper：决定某些 CUDA-only pass 是否启用。
+2. `CUDAPassPipelineBodyPrologue`：从原始高层 IR 走到 `LowerTileOp` 后的低层 tile-op IR。
+3. `CUDAPassPipelineBody`：继续处理 TMEM/barrier/buffer/layout/code shape，最后 split host/device 并生成 packed API/device launch 形态。
+
+#### 20.2.1 顶部 helper：pass 是否启用
+
+`allow_warp_specialized(...)` 控制 warp specialization：
+
+```python
+if (not is_cuda_target(target)) or (not have_tma(target)):
+    return False
+disable_warp_specialized = pass_ctx.config.get("tl.disable_warp_specialized", False)
+return not disable_warp_specialized
+```
+
+这说明 producer/consumer warp specialization 不是所有 CUDA target 都开：它要求 target 是 CUDA，硬件/编译环境支持 TMA，并且 pass config 没有显式关闭 `tl.disable_warp_specialized`。
+
+`module_has_tma(mod)` 则在 `LowerTileOp` 之后读取函数 attr：
+
+```python
+func.attrs.get("tl.has_tma", False)
+```
+
+也就是说，是否真的生成了 TMA，不是 Python frontend 直接猜，而是 `LowerTileOp` 降级后写入 `tl.has_tma`，后面的 `FuseMBarrierArriveExpectTx` 再依据这个事实决定是否运行。
+
+另外几个来自 `pipeline_utils.py` 的 helper 也会影响 pipeline 行为：
+
+| helper | 影响 |
+| --- | --- |
+| `should_force_let_inline` | 是否强制跑 `LetInline` |
+| `should_enable_race_check` | 是否跑 `VerifyParallelLoop` 数据竞争检查 |
+| `allow_vectorize` | 是否启用 `VectorizeLoop` |
+| `LayoutVisual` | pass config 开启时导出 layout 可视化 |
+| `should_enable_aggressive_merge` | 是否启用更激进的 shared memory allocation merge |
+| `should_disable_shared_memory_reuse` | 是否禁止 shared memory reuse |
+
+所以阅读 pipeline 时要记住：源码里的 pass 顺序是主干，但有些 pass 会被 pass config 或 target capability gate 掉。
+
+#### 20.2.2 Prologue 第一段：基础规范化
+
+`CUDAPassPipelineBodyPrologue` 开头做的是 backend lowering 前的通用 IR 清理：
 
 ```text
 BindTarget
-LetInline / wrapper / negative index legalization
-VerifyParallelLoop
+LetInline?                 # pass config 控制
+AddWrapperForSingleBufStore
+LegalizeNegativeIndex
+VerifyParallelLoop?         # race check 开启时
 InjectAssumes
 Simplify
 LayoutReducer
-ProducerConsumerWarpSpecialized
-LowerBlackwell2SM
+```
+
+逐个理解：
+
+- `BindTarget(target)`：把 CUDA target 绑定到 PrimFunc 上，后续 pass 可以读取 SM 版本、target kind、target keys 等信息。
+- `LetInline()`：可选强制内联 let/bind，减少后续 symbolic 分析遇到的间接表达式。
+- `AddWrapperForSingleBufStore()`：给单 buffer store 这类特殊形态补 wrapper，方便后续统一处理。
+- `LegalizeNegativeIndex()`：把负索引规范化成后端更容易证明和生成代码的形式。
+- `VerifyParallelLoop()`：在 race check 未关闭时检查 parallel loop 的合法性。
+- `InjectAssumes()`：给 prover 注入假设，加速/增强后续符号证明。
+- `Simplify()`：清理前面 pass 引入的表达式。
+- `LayoutReducer()`：先给 reducer 相关 buffer/op 设置 layout 信息，为后续 reduction lowering 铺路。
+
+这一段还没有进入 CUDA 特有的硬件指令选择，主要是在整理 IR 的“语法形态”和基础 metadata。
+
+#### 20.2.3 Prologue 第二段：高层 CUDA 结构改写
+
+接下来是两个非常 CUDA/Blackwell 相关的 pass，而且都必须在 `LayoutInference` 前执行：
+
+```python
+if allow_warp_specialized(target=target):
+    mod = tilelang.transform.ProducerConsumerWarpSpecialized()(mod)
+
+mod = tilelang.transform.LowerBlackwell2SM()(mod)
+```
+
+`ProducerConsumerWarpSpecialized` 在 tile-op 还没降成底层 intrinsic 前工作。它会把符合条件的 pipelined tile-op loop 改写成 producer/consumer warp-group 分支，并插入显式 barrier 同步。前面 `warpgroup.py` 里的 `T.ws(...)` 只是表达高层 warp-group scope；真正变成更接近 Hopper TMA/WGMMA 协作结构，就是从这里开始。
+
+`LowerBlackwell2SM` 处理 Blackwell 2CTA/2SM TCGEN05 GEMM。它在 C++ 里会扫描尚未 lowered 的 `tl.tileop.gemm` call：
+
+- 只在 SM100+ target 上生效。
+- 只关心 call annotation 里的 `use_2cta`。
+- 还要求 root block 的 `cluster_dims` 是 `(2, 1, 1)` 或 `(1, 2, 1)`。
+- 条件满足时，在 root block annotation 上写入 `use_2cta=1`，后续 `LowerSharedTmem` 会据此用 2CTA 的方式分配/deallocate TMEM。
+
+关键点是：它必须在 `LowerTileOp` 前跑，因为那时 IR 里还保留 `tl.tileop.gemm` 和 `use_2cta` 这种高层语义；如果等 GEMM 已经降成低层 TCGEN05 intrinsic，再反推就困难很多。
+
+#### 20.2.4 Prologue 第三段：software pipeline 与 layout/tile-op lowering
+
+随后进入 pipeline planning 和最关键的 layout/tile-op 降级：
+
+```text
 IfStmtBinding
 PipelinePlanning
 InjectSoftwarePipeline
 Simplify
 LayoutInference
+LayoutVisual?
 LowerTileOp
+```
+
+`IfStmtBinding()` 先把没有 else 的 if wrapper 规范化，让 pipeline body extraction 面对更稳定的 `SeqStmt` 形态。
+
+`PipelinePlanning()` 读取 `T.Pipelined(...)` 等循环 metadata，规划 stage、buffer 多版本、barrier 关系等软件流水结构。
+
+`InjectSoftwarePipeline()` 按 planning 结果真正重写 loop body。它会让后续 pass 看到已经展开/重排后的 pipeline，而不是还停留在 frontend loop annotation。
+
+`LayoutInference()` 是 `language/` 和 backend 之间最重要的分界之一：它推导 fragment/shared/parallel loop 的 layout。比如 fragment accumulator 每个 thread/warp 持有哪些元素，shared tile 如何被线程访问，后面的 MMA/LDGSTG/store lowering 都依赖这些 layout 信息。
+
+`LayoutVisual(mod)` 默认不做事，只有 pass config 开启 layout visualization 时才导出 txt/png/pdf/svg 等可视化结果。
+
+`LowerTileOp()` 是另一个核心分界：它把高层 `tl.tileop.copy/gemm/reduce` 降成更底层的 TIR/intrinsic。CUDA 下这里会开始决定：
+
+- copy 是 TMA、cp.async、ldmatrix，还是普通 SIMT load/store。
+- GEMM 是 MMA、WGMMA，还是 Blackwell TCGEN05。
+- reduction 如何映射到 fragment/thread allreduce/warp intrinsic。
+- 是否给函数写入 `tl.has_tma` 等 attr，供后续 pass 判断。
+
+读 CUDA backend 时，`LayoutInference -> LowerTileOp` 是第一条主线。前者决定数据排布，后者决定 tile op 兑现成哪类硬件路径。
+
+#### 20.2.5 Prologue 第四段：LowerTileOp 后的早期清理
+
+`LowerTileOp` 后，pipeline 还在 prologue 里继续做一轮低层化前清理：
+
+```text
 LowerL2Persistent
 DecoupleTypeCast
 LegalizeVectorizedLoop
@@ -1779,42 +2074,209 @@ LegalizeSafeMemoryAccess
 LowerAccessPtr
 Simplify
 HoistNonRestrictParams
+```
+
+这段的重点是把刚刚生成的低层 IR 调整到更适合后续 storage/vectorization/codegen 的形态：
+
+- `LowerL2Persistent()`：CUDA-specific，处理 L2 persistent map 相关 lowering。
+- `DecoupleTypeCast()`：把 type cast 和 vectorization 的约束解耦，避免 cast 形态阻碍向量化。
+- `LegalizeVectorizedLoop()`：修正不合法或不适合直接 codegen 的 vectorized loop。
+- `LegalizeSafeMemoryAccess()`：为 safe access/越界保护补条件或安全值。
+- `LowerAccessPtr()`：把 frontend pointer metadata op 降成标准 `tvm_access_ptr`。
+- `HoistNonRestrictParams()`：把 root block 上的 non-restrict 之类 annotation 提到 PrimFunc attr。
+
+到这里，prologue 结束；IR 已经过了核心 tile-op lowering，但还没有完成 buffer flatten、storage rewrite、host/device split。
+
+#### 20.2.6 主体第一段：TMEM、barrier 与 allocation placement
+
+`CUDAPassPipelineBody` 先拿当前 pass context，然后调用 prologue：
+
+```python
+pass_ctx = tilelang.transform.get_pass_context()
+mod = CUDAPassPipelineBodyPrologue(mod, target)
+```
+
+接着处理 CUDA 特有的 TMEM/barrier/allocation：
+
+```text
 LowerSharedTmem
 PlanAndUpdateBufferAllocationLocation
 LowerSharedBarrier
-FuseMBarrierArriveExpectTx
+FuseMBarrierArriveExpectTx?    # module_has_tma(mod) 时
+```
+
+`LowerSharedTmem()` 会把 `shared.tmem` 这类高层 scope 降到具体初始化/分配槽位。前面的 `LowerBlackwell2SM` 如果标了 `use_2cta`，这里就能按 2CTA TCGEN05 的要求处理 TMEM 分配。
+
+`PlanAndUpdateBufferAllocationLocation()` 统一规划 buffer allocation 放在哪里。注释里提到 pipeline barriers 已经由 `InjectSoftwarePipeline` 按最终展开大小创建，所以这里不再做 late MVB barrier fixup。
+
+`LowerSharedBarrier()` 降低 shared barrier 抽象。
+
+`FuseMBarrierArriveExpectTx()` 只在 module 里确实有 TMA 时跑。它识别：
+
+```text
+mbarrier_expect_tx
+TMA issue
+arrive_barrier
+```
+
+这类简单序列，并把 expect_tx + arrive 融成 `arrive_and_expect_tx` 形式。它必须在 `LowerOpaqueBlock` 前做，因为那时相关 TMA/barrier call 还比较容易匹配。
+
+#### 20.2.7 主体第二段：buffer/code shape 规范化
+
+然后是一长串更接近传统 TIR lowering 的 pass：
+
+```text
 HoistGlobalBufferAllocations
 LowerOpaqueBlock
+Simplify
+NarrowDataType(32)
 FlattenBuffer
 ConfigIndexBitwidth
+Simplify
 VectorizeLoop
 StorageRewrite
 LoopUnswitching
 UnrollLoop
+RenormalizeSplitPattern
+Simplify
+RemoveNoOp
+HoistIfThenElse
+```
+
+这段可以理解为把“还有 block/buffer/多维索引/循环结构”的 TIR，整理成更接近 codegen 需要的形态：
+
+- `HoistGlobalBufferAllocations()`：把 global buffer allocation 提到合适位置。
+- `LowerOpaqueBlock()`：去掉/降低不再需要的 opaque block 包装。
+- `NarrowDataType(32)`：把部分 index/表达式压到 32-bit，减少不必要的 64-bit index code。
+- `FlattenBuffer()`：把多维 buffer access flatten 成线性访问。
+- `ConfigIndexBitwidth()`：必须在 `FlattenBuffer` 后，因为它依赖 flatten 后的 index 计算再配置 index bitwidth。
+- `VectorizeLoop()`：按 pass config 决定是否向量化 loop。
+- `StorageRewrite()`：做 storage scope 和 allocation reuse/rewrite。
+- `LoopUnswitching()`：把 loop-invariant if 提到 loop 外。
+- `UnrollLoop()`：展开标记为 unroll 的循环。
+- `RenormalizeSplitPattern()`、`RemoveNoOp()`、`HoistIfThenElse()`：继续清理 split/空语句/if 位置，让后续 verification/codegen 更稳定。
+
+这里已经不是 TileLang DSL 语义的核心区域了，更像是把 TIR 变成 CUDA codegen 友好的 IR。
+
+#### 20.2.8 主体第三段：验证、thread allreduce 和 CUDA intrinsic lowering
+
+接下来是 device IR 合法性检查和更底层 intrinsic lowering：
+
+```text
 VerifyMemory
+AnnotateEntryFunc
 InferFragment
 LowerThreadAllreduce
 LowerLDGSTG
 LowerHopperIntrin
-...
 ```
 
-阅读时最关键的是：
+`VerifyMemory()` 检查 memory scope、thread binding、buffer access 是否满足 TVM/TIR 的基本合法性。
+
+`AnnotateEntryFunc()` 标记 entry function。
+
+`InferFragment()` 和 `LowerThreadAllreduce()` 配合处理 thread-level allreduce。源码注释说这里有一个历史 hack：TileLang 主要使用一个 thread dimension，某些 legalization/simplify 后 var binding 信息会丢，所以把 `LowerThreadAllreduce` 放在这个位置更稳。
+
+CUDA-specific 的两步：
+
+- `LowerLDGSTG()`：降低 CUDA load/store intrinsic，如 `ldg/stg` 相关路径。
+- `LowerHopperIntrin()`：降低 Hopper 相关 intrinsic，例如 WGMMA/TMA/fence/proxy 等最终更接近 PTX/codegen 的调用形式。
+
+#### 20.2.9 主体第四段：host/device split 与 CUDA metadata
+
+然后 pipeline 开始把 device 区域切出来：
 
 ```text
-LayoutInference
-LowerTileOp
+AnnotateDeviceRegions
+SplitHostDevice
+MarkCudaSyncCalls(have_pdl(target))
+AnnotateReadOnlyParams
 ```
 
-`LayoutInference` 推导 fragment/shared/parallel loop layout。
+`AnnotateDeviceRegions()` 先标注 device region，`SplitHostDevice()` 再把 host 和 device 函数拆开。后面 `lower.py` 里的 `Filter(_is_host_call)` / `Filter(_is_device_call)` 就是基于这些 calling convention/attrs 再取出两份 module。
 
-`LowerTileOp` 把 `tl.tileop.copy/gemm/reduce` 等高层 op 降成低层 TIR/intrinsic。
+`MarkCudaSyncCalls(have_pdl(target))` 会标记函数中是否包含 `pdl_sync` / `pdl_trigger` 这类 CUDA sync call，并且会参考当前 target 是否支持 PDL。
 
-当前 CUDA pipeline 的重要分界是：
+`AnnotateReadOnlyParams()` 给只读参数补 metadata，方便后续 codegen/优化识别。
 
-- `ProducerConsumerWarpSpecialized`、`LowerBlackwell2SM`、`PipelinePlanning`、`InjectSoftwarePipeline` 都在 `LayoutInference` 前运行，让 layout inference 看到较最终的高层结构。
-- `LowerTileOp` 之后才进入更偏存储/代码形态的 pass，例如 TMEM/barrier lowering、allocation placement、buffer flatten、vectorize、storage rewrite、host/device split。
-- `LowerTileOp` 会设置类似 `tl.has_tma` 的函数 attr，后续 pipeline 会据此决定是否运行 `FuseMBarrierArriveExpectTx` 等 TMA 相关处理。
+#### 20.2.10 主体第五段：shared memory merge、sync 与 Blackwell fence
+
+`SplitHostDevice` 后才做 shared memory allocation merge：
+
+```python
+mod = tilelang.transform.MergeSharedMemoryAllocations(
+    enable_aggressive_merge=enable_aggressive_merge,
+    disable_reuse=disable_reuse,
+)(mod)
+```
+
+注释里写得很明确：merge 必须在 `SplitHostDevice` 之后，因为合并后的 allocation site 要放在每个 device function 的开头。这里还会受两个 pass config 影响：是否 aggressive merge、是否禁用 shared memory reuse。
+
+随后是同步相关 lowering：
+
+```text
+InjectFenceProxy
+ThreadSync("shared")
+ThreadSync("shared.dyn")
+InjectTcgen05Fence
+MergeIfStmt
+```
+
+`InjectFenceProxy()` 处理 TMA/async proxy 编程模型需要的 proxy fence；不支持这套模型的 target 上 pass 自己会 no-op。
+
+`ThreadSync("shared")` 和 `ThreadSync("shared.dyn")` 把 shared memory scope 的同步补到合适位置。
+
+`InjectTcgen05Fence()` 是 Blackwell/TMEM 的关键修正。C++ 注释说得很清楚：TMEM 在自己的 address space，普通 `__syncthreads` / mbarrier 不会自动让 TMEM 写入跨线程可见，所以需要插入：
+
+```text
+tcgen05.fence::before_thread_sync
+tcgen05.fence::after_thread_sync
+```
+
+这个 pass 只在 SM100+ 且函数里真的有 TCGEN05/TMEM op 时生效。它会保守处理三类边界：
+
+- 在 `tvm_storage_sync("shared")` / `("shared.dyn")` 前后包 before/after fence。
+- 在 `mbarrier_wait_parity` 后，如果后续线性区域会使用 TCGEN05/TMEM，就插入 after fence。
+- 在普通 barrier arrive 前，如果前面线性区域使用过 TCGEN05/TMEM，就插入 before fence。
+
+`MergeIfStmt()` 最后再合并前面各种 safety/sync pass 可能产生的相邻或重复条件。
+
+#### 20.2.11 主体第六段：warp-group reg、packed API、device launch 与 persistent block
+
+最后收尾：
+
+```text
+AnnotateWarpGroupRegAlloc?      # warp specialization 开启时
+MakePackedAPI
+Simplify
+LowerDeviceKernelLaunch
+PersistThreadblock
+```
+
+`AnnotateWarpGroupRegAlloc()` 只在 warp specialization 开启时跑。它会分析 producer/consumer 分支里的 register hint，并注入合适的 `set_max_nreg` call，控制 warp-specialized kernel 中不同 warp group 的寄存器分配。
+
+`MakePackedAPI()` 把函数 ABI 改成 TVM packed API 风格。
+
+`LowerDeviceKernelLaunch()` 把 device kernel launch 抽象降到更底层的 host-side launch call / device function attr 形态。
+
+`PersistThreadblock()` 是 CUDA-specific 的 persistent threadblock transform，用于把普通 threadblock 映射改成 persistent threadblock 风格。
+
+#### 20.2.12 读这段代码时最重要的分界
+
+把整条 pipeline 压成几条阅读主线：
+
+| 分界 | 为什么重要 |
+| --- | --- |
+| `ProducerConsumerWarpSpecialized` 前后 | 高层 pipelined tile-op loop 开始变成 producer/consumer warp-group 结构 |
+| `PipelinePlanning` / `InjectSoftwarePipeline` | `T.Pipelined` 从 annotation 变成真实重排后的 loop/body |
+| `LayoutInference` | 决定 fragment/shared/parallel loop 的数据排布 |
+| `LowerTileOp` | `tl.tileop.copy/gemm/reduce` 兑现成 CUDA 硬件路径，并写入 `tl.has_tma` 等 attr |
+| `LowerSharedTmem` / `LowerSharedBarrier` | Blackwell TMEM 和 barrier 抽象开始落到具体分配/同步 |
+| `FlattenBuffer` / `StorageRewrite` | IR 从多维 buffer/高层 storage 形态进入 codegen 友好的线性 storage 形态 |
+| `SplitHostDevice` | host/device 函数真正分开，后面 shared memory merge 要在 device function 内做 |
+| `InjectTcgen05Fence` | Blackwell TCGEN05/TMEM 的跨线程可见性在这里补 fence |
+
+所以 CUDA backend 阅读顺序建议是：先读 `CUDAPassPipelineBodyPrologue`，抓住 `LayoutInference -> LowerTileOp`；再读 `CUDAPassPipelineBody`，重点看 TMEM/barrier、buffer flatten/storage rewrite、host/device split、以及 Blackwell/Hopper 的 CUDA-only pass。
 
 ### 20.3 C++ `LowerTileOp`
 

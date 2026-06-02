@@ -79,6 +79,185 @@ IR Builder / Frame 层
 
 ---
 
+## 核心精髓：两种 JIT 风格与 AST 改写
+
+如果只能抓住 `language/` 的一个核心机制，那就是这一段：**TileLang 同时支持 lazy style 和 eager style；lazy style 基本走 TVM script parser，eager style 则靠 TileLang 自己的 AST mutator 把 Python 函数改写成 Builder 调用。**
+
+这也是 `eager/ast.py` 和 `eager/builder.py` 的存在意义。
+
+### lazy style：返回一个内部 `@T.prim_func`
+
+lazy style 的用户代码通常像这样：
+
+```python
+# lazy style: 返回一个内部 @T.prim_func
+@tilelang.jit
+def make_kernel(M, N):
+    @T.prim_func
+    def kernel(A: T.Tensor((M, N), T.float32)):
+        ...
+
+    return kernel
+```
+
+这个风格里，外层 Python 函数更像一个 **kernel factory**。它接收编译期参数，比如 `M/N/block_M/block_N`，然后构造并返回一个内部 `PrimFunc`。
+
+关键点：
+
+- 内部 `@T.prim_func` 基本走 TVM/TIR script parser 路线。
+- 外层函数被调用后，直接返回 `PrimFunc`。
+- `JITFunc` 会把这个 `PrimFunc` 缓存为一个 `TirTemplate.from_lazy_style(...)`。
+- 这种风格适合“先生成 kernel object，再单独调用/查看/benchmark”的流程。
+
+### eager style：直接在 JIT 函数体里写 DSL
+
+eager style 的用户代码通常像这样：
+
+```python
+# eager style: 直接在 jit 函数体里写 DSL
+@tilelang.jit
+def kernel(A, B):
+    M, N = T.const("M, N")
+
+    A: T.Tensor((M, N), T.float32)
+    B: T.Tensor((M, N), T.float32)
+    C = T.empty((M, N), T.float32)
+
+    with T.Kernel(...):
+        ...
+
+    return C
+```
+
+这个风格里，用户看起来像是在直接写一个 Python 函数，但它不是普通 Python 函数语义。它会被 `eager/ast.py` 改写，然后在 `Builder` 上下文中执行，从而构造 `PrimFunc`。
+
+关键点：
+
+- `T.const(...)` 用来声明 eager JIT 的动态 shape 变量。
+- `A: T.Tensor(...)` 这样的 annotation 会被 AST mutator 捕获，并交给 `Builder.bind(...)` 处理。
+- `C = T.empty(...)` 声明输出 tensor，不是立即分配 device memory。
+- `with T.Kernel(...)` 构造 kernel launch frame。
+- `return C` 告诉 JIT wrapper 哪些 tensor 是输出。
+
+### lazy/eager 的关键判定：`JITFunc._is_lazy_style`
+
+核心判定发生在 `tilelang/language/eager/builder.py` 的 `JITFunc._is_lazy_style(...)`。
+
+可以把逻辑简化成：
+
+```text
+如果函数体里包含内部 @T.prim_func
+        -> lazy
+否则尝试调用原始函数
+        如果返回 PrimFunc
+                -> lazy
+        如果调用过程中因为没有 Builder 触发 JITNoBuilderError / EagerJITBuildError
+                -> eager
+        否则
+                -> eager
+```
+
+为什么 eager style 会触发 `JITNoBuilderError`？因为 eager style 的原始函数体里会直接调用 `T.const()`、`T.Kernel()`、`T.empty()` 这类必须依赖 `Builder.current()` 的 DSL API。第一次用于 mode inference 的普通调用没有 Builder，所以报错反而成了“这是 eager DSL，需要走 AST/Builder trace”的信号。
+
+这点很精妙：**TileLang 用“原函数是否能直接返回 PrimFunc”来判断 lazy；如果原函数需要 Builder 才能运行，就切到 eager trace 路线。**
+
+### AST 改写设计：不是执行 Python kernel，而是执行改写后的 Python 函数
+
+eager 模式最容易误解。它的核心不是：
+
+```text
+执行用户写的 Python kernel
+```
+
+而是：
+
+```text
+先把用户 Python 函数 AST 改写成 Builder 调用，
+再执行这个被改写后的 Python 函数，
+执行过程中不断向 IRBuilder 追加 TIR 节点。
+```
+
+`eager/ast.py` 里的 `DSLMutator` 会把普通 Python 语句改成 Builder API。
+
+典型改写如下：
+
+| 用户 Python 语法 | 改写后的核心形式 | 作用 |
+| --- | --- | --- |
+| `if cond: ... else: ...` | `__tb.ctx_if / ctx_then / ctx_else` | 普通 bool 走 Python 分支，`PrimExpr` 生成 TIR `If` |
+| `for i in T.serial(...)` | `for tmp in __tb.ctx_for(...): i = __tb.bind(...)` | 进入 TIR ForFrame 并绑定 loop var |
+| `with T.Kernel(...)` | `with __tb.ctx_with(T.Kernel(...))` | 进入 KernelLaunchFrame |
+| `T.copy(A, B)` | `__tb.eval(T.copy(A, B))` | 把 `tl.tileop.copy` call 追加到 IR |
+| `x: T.int32 = expr` | `__tb.bind("x", expr, annot)` | 处理 typed let / scalar bind |
+| `A: T.Tensor(...)` | `__tb.bind("A", value, tensor_annot)` | 处理 buffer 参数 annotation |
+| 变量读取 `x` | `__tb.rval("x", x)` | 给 Builder 机会处理特殊变量、let、macro、OutTensor |
+| `return C` | `__tb.ret(C)` | eager 输出 tensor 收集 |
+
+所以 eager 模式下，“执行 Python”只是构建 IR 的手段。真正有意义的是执行期间产生的 `PrimFunc`。
+
+### Builder 是 AST 改写后的落地点
+
+`DSLMutator` 只负责把语法改成 `__tb.xxx(...)`，真正构造 IR 的是 `Builder`：
+
+```text
+DSLMutator
+    Python AST -> __tb.ctx_for / __tb.eval / __tb.bind / __tb.ctx_with
+
+Builder
+    __tb.ctx_for   -> tirx ForFrame
+    __tb.ctx_if    -> tirx If/Then/Else frame
+    __tb.ctx_with  -> KernelLaunchFrame / WarpSpecializeFrame 等 context
+    __tb.eval      -> evaluate / buffer_store / enter frame
+    __tb.bind      -> Var / Buffer / Let / Tensor annotation / OutTensor
+
+IRBuilder
+    记录最终 TIR/TIRX AST
+```
+
+这一层关系可以用一句话概括：
+
+> `ast.py` 负责“把 Python 语法换成可拦截的 Builder 调用”，`builder.py` 负责“把这些 Builder 调用落成真正的 TIR/TIRX 节点”。
+
+### 两阶段 eager JIT：`phase1` 与 `phase2`
+
+eager JIT 还有一个非常关键的两阶段设计，主要服务动态 shape 和 `T.const(...)`。
+
+```text
+phase1: 构造模板 PrimFunc
+    - T.const("M, N") 创建 constexpr Var
+    - A: T.Tensor((M, N), dtype) 把 constexpr Var 放进 buffer shape/stride
+    - TirTemplate.create(...) 扫描 buffer_map，建立 constexpr -> tensor shape/stride 的 matcher
+
+phase2: 根据真实 tensor 参数补全 constexpr
+    - 从实际输入 tensor 的 shape/stride 或显式 kwargs 中解析 M/N/K
+    - builder.eager_jit_subs = {"M": real_M, "N": real_N, ...}
+    - 重新执行 IRGenerator，得到具体 shape 的 PrimFunc
+```
+
+这解释了为什么 eager style 可以写：
+
+```python
+M, N = T.const("M, N")
+A: T.Tensor((M, N), T.float32)
+```
+
+而真正调用时又能从实际 tensor shape 推导出 `M/N`。
+
+### 这段机制为什么是 `language/` 的精髓
+
+因为整个 `language/` 的大多数 API 都依赖这条链：
+
+```text
+用户 Python 写法
+    -> AST mutator 改写成 Builder 调用
+    -> Builder 在 IRBuilder 中创建 TIR/TIRX 节点
+    -> 高层 DSL API 生成 tl.tileop.* 或 frame/annotation
+    -> lowering pipeline 消费这些高层语义
+```
+
+如果没有 AST 改写和 Builder，`T.Kernel`、`T.copy`、`T.gemm` 只是普通 Python 函数；有了这层机制，它们才变成 TileLang embedded DSL。
+
+---
+
 ## 3. 从用户代码到 CUDA/HIP/CPU 的整体数据流
 
 以 [examples/quickstart.py](examples/quickstart.py) 中的 GEMM 风格为例，用户写的是：

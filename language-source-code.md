@@ -1877,3 +1877,363 @@ T.copy(A_tile, A_s, prefer_instruction="tma")
 所以阅读这个目录时，不要只看函数名，也不要把 `T.copy/T.gemm` 当普通 Python 函数理解。要始终追问：**它往 IR 里放了什么语义？这个语义后面由哪个 pass 消费？**
 
 抓住这条线，`tilelang/language` 就不是一堆零散 API，而是一套完整的 Python embedded DSL 前端。
+
+---
+
+## 27. `KernelLaunchFrame`、`TIRFrame`、`FrameStack` 问答补充
+
+这一章记录一次围绕 `tilelang/language/kernel.py` 的源码阅读问题，重点解释几个容易混淆的概念：`TIRFrame`、`KernelLaunchFrame`、`FrameStack`、`self.frames`、`SBlockFrame` 和 Python slice 语义。
+
+### 27.1 `TIRFrame` 是什么
+
+`TIRFrame` 可以理解成 TVM/TIRX script builder 里的“语法作用域帧”。
+
+用户写 TileLang DSL 时，很多代码并不是立即执行计算，而是在构造 TIR AST。例如：
+
+```python
+with T.Kernel(...) as bx:
+    ...
+```
+
+进入 `with` 时，builder 需要知道“现在正在构造一个 kernel launch 作用域”；退出 `with` 时，builder 要把这个作用域收起来，组装成对应的 TIR 结构。`TIRFrame` 就是这类 builder-time context object 的基类。
+
+所以 `TIRFrame` 主要服务于 **构造 TIR 的过程**：
+
+```text
+进入 frame
+    -> 建立 IRBuilder 上下文
+    -> 收集 body 里的 statements / 子 frame
+
+退出 frame
+    -> 把收集到的内容组装成 TIR node
+    -> 返回给上层 builder
+```
+
+最终真正留下来并被 lowering/codegen 使用的是 TIR tree，例如 `For`、`Block`、`SeqStmt`、`AttrStmt`、`PrimFunc` 等。`TIRFrame` / `KernelLaunchFrame` 本身更像构造期脚手架，构造出 TIR tree 之后，语义上就不需要继续参与运行时执行。
+
+### 27.2 `KernelLaunchFrame` 是什么
+
+`KernelLaunchFrame` 是 TileLang 为 `T.Kernel(...)` 定制的一个 `TIRFrame` 子类：
+
+```python
+@register_object("tl.KernelLaunchFrame")
+class KernelLaunchFrame(TIRFrame):
+    ...
+```
+
+它代表一个 kernel launch 的外层作用域。用户写：
+
+```python
+with T.Kernel(grid_x, grid_y, threads=(128, 2)) as (bx, by):
+    ...
+```
+
+`T.Kernel(...)` 最终通过 `_ffi_api.KernelLaunch(blocks, threads, attrs)` 创建一个 `KernelLaunchFrame`。这个 frame 内部的 `self.frames` 持有 launch 骨架所需的一组直接子 frame，大致可以理解成：
+
+```text
+KernelLaunchFrame
+  self.frames:
+    blockIdx.x frame
+    blockIdx.y frame
+    blockIdx.z frame        # 如果对应维度被创建
+    threadIdx.x frame
+    threadIdx.y frame
+    threadIdx.z frame
+    SBlockFrame             # kernel body + kernel attrs 所在的 statement block
+```
+
+更精确地说：`KernelLaunchFrame` 不是“把 kernel body 里所有嵌套 TIRFrame 都平铺保存起来”的对象，而是一个表示 kernel launch 外壳的复合 frame。它的 `self.frames` 是这个 launch 的直接组成部分：block/thread 绑定，以及承载 body 的 `SBlockFrame`。
+
+### 27.3 `FrameStack` 和 `self.frames` 不是一回事
+
+`kernel.py` 里定义的 `FrameStack` 是 TileLang 自己写的一个小栈，本质是 `deque` 包装：
+
+```python
+class FrameStack:
+    def push(self, item): ...
+    def pop(self): ...
+    def top(self): ...
+```
+
+它的作用是记录“当前线程里，正在进入哪个 `KernelLaunchFrame`”。
+
+进入 kernel launch 时：
+
+```python
+def __enter__(self):
+    super().__enter__()
+    _get_current_stack().push(self)
+```
+
+退出时：
+
+```python
+def __exit__(self, ptype, value, trace):
+    stack = _get_current_stack()
+    if stack.top() is self:
+        stack.pop()
+    super().__exit__(ptype, value, trace)
+```
+
+这个栈服务于：
+
+```python
+KernelLaunchFrame.Current()
+```
+
+也就是让 `T.get_thread_binding()`、`T.get_block_binding()` 这类 API 不需要用户显式传当前 kernel frame，就能找到当前上下文。
+
+而 `self.frames` 来自父类 `TIRFrame` / builder 体系。它不是 `FrameStack`，而是当前这个 `KernelLaunchFrame` 内部的直接子 frame 列表。
+
+两者区别可以这样记：
+
+```text
+FrameStack:
+    管“当前线程现在处在哪个 KernelLaunchFrame 里”
+    是 thread-local 的当前上下文栈
+
+self.frames:
+    管“这个 KernelLaunchFrame 自己由哪些子 frame 组成”
+    是当前 frame 的 launch 骨架结构
+```
+
+### 27.4 为什么 `__exit__` 要判断 `stack.top() is self`
+
+正常情况下，`with T.Kernel(...)` 的进入和退出是严格配对的：
+
+```text
+__enter__ -> push(self)
+__exit__  -> pop(self)
+```
+
+但 `__exit__` 没有直接 `stack.pop()`，而是写成：
+
+```python
+if stack.top() is self:
+    stack.pop()
+```
+
+这是为了保证当前 frame 只弹出自己。如果因为嵌套 frame、异常路径或 builder 状态错乱导致栈顶已经不是当前对象，直接 `pop()` 会误删别的 frame，让上下文更乱。
+
+这里用 `is` 而不是 `==`，是因为要比较对象身份：退出哪个 `with`，就只能清理同一个 `KernelLaunchFrame` 实例。
+
+### 27.5 `SBlockFrame` 为什么不展开成 x/y/z 三维
+
+这里最容易混淆的是两个 “block” 不是一个概念。
+
+```text
+blockIdx.x / blockIdx.y / blockIdx.z:
+    CUDA launch 的 grid/block 维度索引
+    每一维都有独立 iter_var
+
+SBlockFrame:
+    TVM/TIR 里的 statement block / scope block
+    用来承载 kernel body 和 annotations
+```
+
+所以 `threadIdx.x/y/z` 或 `blockIdx.x/y/z` 是索引维度，天然可以按 x/y/z 展开；但 `SBlockFrame` 是语句作用域，不是索引空间。
+
+可以把 `SBlockFrame` 类比成 CUDA kernel body 外面那层大括号：
+
+```cuda
+__global__ void kernel(...) {
+    // TileLang DSL body 最终构造出的 statements 在这里
+}
+```
+
+它不表示 `block.x`、`block.y`、`block.z`，而是表示一个承载 body 和属性的 TIR block。
+
+在 `KernelLaunchFrame.__enter__` 中，最后一个 frame 会被检查为 `SBlockFrame`：
+
+```python
+last_block_frame = self.frames[-1]
+assert isinstance(last_block_frame, SBlockFrame)
+```
+
+然后从它的 `annotations` 里读取 kernel 级别属性：
+
+```python
+maybe_cpu = last_block_frame.annotations.get("tilelang.is_cpu_kernel_frame", False)
+```
+
+例如 CPU kernel 标记、`pragma_import_c`、`cluster_dims` 这类信息都挂在这个 block scope 上。
+
+### 27.6 `get_block_bindings()` 取的是什么
+
+`get_block_bindings()` 的实现是：
+
+```python
+def get_block_bindings(self) -> list[Var]:
+    return [frame.iter_var.var for frame in self.frames[0:-4]]
+```
+
+这里读取的就是 `blockIdx.*` 对应的 frame 绑定变量。
+
+对 GPU kernel launch，代码约定最后 4 个 frame 是：
+
+```text
+threadIdx.x frame
+threadIdx.y frame
+threadIdx.z frame
+SBlockFrame
+```
+
+因此：
+
+```python
+self.frames[0:-4]
+```
+
+表示“从开头取到倒数第 4 个之前”，也就是排除最后 4 个，只留下前面的 `blockIdx.*` frame。
+
+如果要取最后 4 个，Python slice 语法才是：
+
+```python
+self.frames[-4:]
+```
+
+举例：
+
+```python
+frames = [
+    "blockIdx.x",
+    "blockIdx.y",
+    "threadIdx.x",
+    "threadIdx.y",
+    "threadIdx.z",
+    "SBlockFrame",
+]
+
+frames[0:-4]
+# ["blockIdx.x", "blockIdx.y"]
+
+frames[-4:]
+# ["threadIdx.x", "threadIdx.y", "threadIdx.z", "SBlockFrame"]
+```
+
+所以 `get_block_bindings()` 用 `self.frames[0:-4]` 是为了取 block binding，而不是取最后 4 个。
+
+### 27.7 `get_thread_bindings()` 为什么是 `self.frames[-4:-1]`
+
+`get_thread_bindings()` 的实现是：
+
+```python
+def get_thread_bindings(self) -> list[Var]:
+    return [frame.iter_var.var for frame in self.frames[-4:-1]]
+```
+
+这个 slice 表示：
+
+```text
+从倒数第 4 个开始，取到倒数第 1 个之前
+```
+
+也就是：
+
+```text
+threadIdx.x frame
+threadIdx.y frame
+threadIdx.z frame
+```
+
+不包含最后那个 `SBlockFrame`。
+
+单独取某一维 thread binding 时：
+
+```python
+def get_thread_binding(self, dim: int = 0) -> Var:
+    return self.frames[-4 + dim].iter_var.var
+```
+
+对应关系是：
+
+```text
+dim = 0 -> self.frames[-4] -> threadIdx.x
+dim = 1 -> self.frames[-3] -> threadIdx.y
+dim = 2 -> self.frames[-2] -> threadIdx.z
+```
+
+### 27.8 `with T.Kernel(...) as ...` 返回 block binding
+
+GPU 情况下，`KernelLaunchFrame.__enter__` 返回的是 block binding，而不是 thread binding：
+
+```python
+return _normalize_bindings([frame.iter_var.var for frame in self.frames[0:-4]])
+```
+
+所以：
+
+```python
+with T.Kernel(grid_x, grid_y, threads=128) as (bx, by):
+    ...
+```
+
+这里的 `bx`、`by` 是 `blockIdx.x`、`blockIdx.y` 绑定变量。
+
+thread binding 要通过 API 查询：
+
+```python
+tx = T.get_thread_binding(0)
+tx, ty, tz = T.get_thread_bindings()
+```
+
+单维 kernel 下，`_normalize_bindings` 会把单元素 list 转成裸 `Var`：
+
+```python
+with T.Kernel(n, threads=128) as bx:
+    ...
+```
+
+同时 `kernel.py` 给 `Var` 补了 `__iter__` 和 `__len__`，所以也兼容：
+
+```python
+with T.Kernel(n, threads=128) as (bx,):
+    ...
+```
+
+### 27.9 CPU kernel 的特殊路径
+
+GPU kernel 的 frame 末尾约定是 `threadIdx.x/y/z + SBlockFrame`，所以 block binding 用 `self.frames[0:-4]`。
+
+CPU kernel 不创建 thread binding，`KernelLaunchFrame.__enter__` 会走另一条路径：
+
+```python
+if maybe_cpu:
+    return _normalize_bindings([frame.vars[0] for frame in self.frames[0:-1]])
+```
+
+也就是排除最后的 `SBlockFrame`，返回普通 for frame 的 loop var。
+
+这也解释了为什么 GPU 和 CPU 分支切片不同：GPU 多了三个 thread binding frame。
+
+### 27.10 最终心智模型
+
+可以把这组关系压缩成一张图：
+
+```text
+thread-local FrameStack
+  top -> 当前正在构造的 KernelLaunchFrame
+
+KernelLaunchFrame  # 一个 T.Kernel(...) launch 作用域
+  self.frames      # launch 的直接子 frame
+    blockIdx.* frame(s)
+    threadIdx.x frame
+    threadIdx.y frame
+    threadIdx.z frame
+    SBlockFrame    # kernel body + annotations
+
+TIR tree
+  frame 退出后真正生成的 IR 结果
+  后续 lowering/codegen 消费的是这里的 IR node
+```
+
+因此这轮讨论的结论是：
+
+```text
+FrameStack 是“当前 kernel launch 上下文栈”。
+self.frames 是“当前 KernelLaunchFrame 的直接子 frame 列表”。
+get_block_bindings() 从 self.frames[0:-4] 取 blockIdx.*。
+get_thread_bindings() 从 self.frames[-4:-1] 取 threadIdx.x/y/z。
+SBlockFrame 是 kernel body 的 TIR statement block，不是三维索引。
+TIRFrame / KernelLaunchFrame 是构造 TIR 时的辅助结构，最终产物是 TIR tree。
+```

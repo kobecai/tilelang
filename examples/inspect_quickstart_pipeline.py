@@ -3,38 +3,122 @@ from __future__ import annotations
 # pyright: reportMissingImports=false, reportInvalidTypeForm=false, reportCallIssue=false, reportRedeclaration=false
 
 import argparse
+import importlib
+import importlib.util
 import json
 import re
 import shutil
+import sys
+import sysconfig
 import textwrap
-from dataclasses import dataclass
 from pathlib import Path
+
+
+def _preload_stdlib_inspect() -> None:
+    """Avoid self-import when this standalone script is renamed to inspect.py."""
+    if Path(__file__).name != "inspect.py":
+        return
+
+    current_file = Path(__file__).resolve()
+    existing_inspect = sys.modules.get("inspect")
+    if existing_inspect is not None:
+        existing_file = getattr(existing_inspect, "__file__", None)
+        if existing_file and Path(existing_file).resolve() != current_file:
+            return
+
+    inspect_path = Path(sysconfig.get_path("stdlib")) / "inspect.py"
+    spec = importlib.util.spec_from_file_location("inspect", inspect_path)
+    if spec is None or spec.loader is None:
+        return
+
+    inspect_module = importlib.util.module_from_spec(spec)
+    sys.modules["inspect"] = inspect_module
+    spec.loader.exec_module(inspect_module)
+
+
+_preload_stdlib_inspect()
+
+
+def _prepend_source_checkout_root() -> None:
+    for candidate in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
+        if (candidate / "tilelang" / "__init__.py").is_file() and str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+            return
+
+
+_prepend_source_checkout_root()
+
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import tilelang
 import tilelang.language as T
 from tilelang import tvm
-from tilelang.backend.pass_pipeline.pipeline_utils import (
-    LayoutVisual,
-    allow_vectorize,
-    should_disable_shared_memory_reuse,
-    should_enable_aggressive_merge,
-    should_enable_race_check,
-    should_force_let_inline,
-)
-from tilelang.contrib.nvcc import have_pdl
-from tilelang.cuda.pipeline import allow_warp_specialized, module_has_tma
-from tilelang.engine.lower import (
-    canon_target_host,
-    extrac_params,
-    get_device_call,
-    get_host_call,
-    is_cpu_device_backend,
-)
-from tilelang.engine.semantic_check import PreLowerSemanticCheck
+from tilelang.contrib import nvcc
 from tilelang.transform import PassConfigKey
-from tvm import s_tir, tirx  # type: ignore
+from tvm.ir import CallingConv
 from tvm.target import Target
+
+try:
+    tirx = importlib.import_module("tvm.tirx")
+except ImportError as err:
+    tirx = None
+    _TIRX_IMPORT_ERROR = err
+else:
+    _TIRX_IMPORT_ERROR = None
+
+
+def _resolve_tvm_transform(name: str) -> Callable[[], Any]:
+    candidates = ("tvm.s_tir.transform", "tvm.tir.transform", "tvm.tirx.transform")
+    for module_name in candidates:
+        try:
+            transform_module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        transform_factory = getattr(transform_module, name, None)
+        if transform_factory is not None:
+            return transform_factory
+    raise ImportError(f"Cannot find TVM transform `{name}` in {', '.join(candidates)}")
+
+
+def tvm_transform(name: str) -> Callable[[], Any]:
+    return lambda: _resolve_tvm_transform(name)()
+
+
+def pass_config_key(name: str, default: str) -> str:
+    key = getattr(PassConfigKey, name, None)
+    if key is None:
+        return default
+    return key.value if hasattr(key, "value") else str(key)
+
+
+def safe_repr(value: Any) -> str:
+    try:
+        return repr(value)
+    except Exception as err:
+        return f"<repr failed: {type(err).__name__}: {err}>"
+
+
+def object_summary(value: Any) -> str:
+    if value is None:
+        return "None"
+    ty = type(value)
+    return f"{ty.__module__}.{ty.__qualname__}(id=0x{id(value):x})"
+
+
+def format_mapping(title: str, mapping: Any) -> list[str]:
+    lines = [f"{title}:"]
+    if not mapping:
+        lines.append("  <empty>")
+        return lines
+    try:
+        items = mapping.items()
+    except AttributeError:
+        lines.append(f"  {safe_repr(mapping)}")
+        return lines
+    for key, value in sorted(items, key=lambda item: str(item[0])):
+        lines.append(f"  {key}: {safe_repr(value)}")
+    return lines
 
 
 @tilelang.jit
@@ -79,6 +163,8 @@ class ArtifactDumper:
         self.out_dir = out_dir
         self.print_ir = print_ir
         self.step = 0
+        self.dumped_ir_generator = False
+        self.dumped_ir_generator_runtime = False
         self.artifacts: list[Artifact] = []
 
     def _next_path(self, title: str, suffix: str) -> Path:
@@ -145,6 +231,138 @@ def make_cuda_target(arch: str) -> Target:
     return Target({"kind": "cuda", "arch": arch})
 
 
+def _pass_config_get(pass_ctx: Any, key: str | PassConfigKey, default: Any = None) -> Any:
+    key_value = key.value if isinstance(key, PassConfigKey) else key
+    return pass_ctx.config.get(key_value, default)
+
+
+def allow_vectorize(pass_ctx: Any | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    return not bool(_pass_config_get(pass_ctx, "tirx.disable_vectorize", False))
+
+
+def should_enable_aggressive_merge(pass_ctx: Any | None = None, target: Target | None = None) -> bool:
+    del target
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    return bool(_pass_config_get(pass_ctx, PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE, False))
+
+
+def should_force_let_inline(pass_ctx: Any | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    return bool(_pass_config_get(pass_ctx, PassConfigKey.TL_FORCE_LET_INLINE, False))
+
+
+def should_enable_race_check(pass_ctx: Any | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    return not bool(_pass_config_get(pass_ctx, PassConfigKey.TL_DISABLE_DATA_RACE_CHECK, False))
+
+
+def should_disable_shared_memory_reuse(pass_ctx: Any | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    return bool(_pass_config_get(pass_ctx, PassConfigKey.TL_DISABLE_SHARED_MEMORY_REUSE, False))
+
+
+def _layout_visual_formats(pass_ctx: Any | None = None) -> list[str]:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    formats_value = _pass_config_get(pass_ctx, PassConfigKey.TL_LAYOUT_VISUALIZATION_FORMATS, "")
+    if not formats_value:
+        return ["txt"]
+
+    formats_str = str(formats_value).strip().lower()
+    if formats_str == "all":
+        return ["txt", "png", "pdf", "svg"]
+    return [fmt.strip() for fmt in formats_str.split(",") if fmt.strip()]
+
+
+def LayoutVisual(module: tvm.IRModule) -> None:
+    pass_ctx = tilelang.transform.get_pass_context()
+    if _pass_config_get(pass_ctx, PassConfigKey.TL_LAYOUT_VISUALIZATION_ENABLE, False):
+        tilelang.analysis.LayoutVisual(formats=_layout_visual_formats(pass_ctx))(module)
+
+
+def _have_pdl(target: Target) -> bool:
+    return bool(nvcc.have_pdl(target))
+
+
+def _have_tma(target: Target | None = None) -> bool:
+    have_tma = getattr(nvcc, "have_tma", None)
+    return bool(have_tma(target)) if have_tma is not None else False
+
+
+def allow_warp_specialized(pass_ctx: Any | None = None, target: Target | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    if target is None or target.kind.name != "cuda" or not _have_tma(target):
+        return False
+    return not bool(_pass_config_get(pass_ctx, "tl.disable_warp_specialized", False))
+
+
+def module_has_tma(module: tvm.IRModule) -> bool:
+    return any(func.attrs and func.attrs.get("tl.has_tma", False) for _, func in module.functions.items())
+
+
+def is_cpu_device_backend(target: Target) -> bool:
+    return target.kind.name == "c"
+
+
+def _has_device_kernel_launch(attrs: Any) -> bool:
+    return bool(attrs and "calling_conv" in attrs and attrs["calling_conv"] == CallingConv.DEVICE_KERNEL_LAUNCH)
+
+
+def _is_device_call_c_device(func: tirx.PrimFunc) -> bool:
+    attrs = func.attrs
+    calling_conv = attrs.get("calling_conv", CallingConv.DEFAULT)
+    is_cpacked = calling_conv == CallingConv.C_PACKED_FUNC
+    if "target" in attrs and attrs["target"].kind.name == "c" and not is_cpacked:
+        return True
+    return _has_device_kernel_launch(attrs)
+
+
+def _is_device_call(func: tirx.PrimFunc) -> bool:
+    return _has_device_kernel_launch(func.attrs)
+
+
+def get_device_call(is_device_c: bool = False) -> Callable[[tirx.PrimFunc], bool]:
+    return _is_device_call_c_device if is_device_c else _is_device_call
+
+
+def get_host_call(is_device_c: bool = False) -> Callable[[tirx.PrimFunc], bool]:
+    return lambda func: not get_device_call(is_device_c)(func)
+
+
+def canon_target_host(target: str | Target, target_host: str | Target | None) -> str | Target:
+    del target
+    return target_host or ("llvm" if tvm.runtime.enabled("llvm") else "c")
+
+
+def extrac_params(func: tirx.PrimFunc) -> list[str]:
+    params = []
+    for var in func.params:
+        if var in func.buffer_map:
+            buffer = func.buffer_map[var]
+            shape = ", ".join(str(dim) for dim in buffer.shape)
+            params.append(f"{buffer.name}: Tensor([{shape}], {buffer.dtype})")
+        else:
+            params.append(f"{var}: {var.dtype}")
+    return params
+
+
+def PreLowerSemanticCheck(module: tvm.IRModule) -> None:
+    pass_ctx = tilelang.transform.get_pass_context()
+    if _pass_config_get(pass_ctx, PassConfigKey.TL_DISABLE_PRELOWER_SEMANTIC_CHECK, False):
+        return
+    if _pass_config_get(pass_ctx, PassConfigKey.TL_AST_PRINT_ENABLE, False):
+        tilelang.analysis.ASTPrinter()(module)
+    tilelang.analysis.NestedLoopChecker()(module)
+    tilelang.analysis.FragmentLoopChecker()(module)
+
+
 def run_pass(
     dumper: ArtifactDumper,
     title: str,
@@ -167,6 +385,109 @@ def run_pass(
     return next_module
 
 
+def dump_ir_generator_artifacts(args: argparse.Namespace, dumper: ArtifactDumper) -> None:
+    if not args.dump_ir_generator or dumper.dumped_ir_generator:
+        return
+    dumper.dumped_ir_generator = True
+
+    original_source = getattr(matmul, "func_source", None)
+    if original_source:
+        dumper.dump_text(
+            "ir_generator_00_original_jit_source",
+            textwrap.dedent(str(original_source)).strip() + "\n",
+            "Original Python function source captured by @tilelang.jit before eager IRGenerator mutation.",
+            suffix=".py",
+        )
+
+    jit_func = getattr(matmul, "func", None)
+    ir_gen = getattr(jit_func, "ir_gen", None)
+    if ir_gen is None:
+        dumper.dump_text(
+            "ir_generator_unavailable",
+            "This TileLang version does not expose matmul.func.ir_gen, so IRGenerator source cannot be dumped.\n",
+            "IRGenerator object is unavailable on this installed TileLang version.",
+        )
+        return
+
+    ir_source = getattr(ir_gen, "source", None)
+    if ir_source:
+        dumper.dump_text(
+            "ir_generator_01_mutated_source",
+            str(ir_source).rstrip() + "\n",
+            "AST-mutated Python source compiled by TileLang into the eager IRGenerator closure.",
+            suffix=".py",
+        )
+
+    metadata_lines = [
+        "# IRGenerator Metadata",
+        "",
+        f"JIT object: {object_summary(matmul)}",
+        f"JIT mode: {safe_repr(getattr(matmul, 'mode', None))}",
+        f"Signature: {safe_repr(getattr(matmul, 'signature', None))}",
+        f"JITFunc object: {object_summary(jit_func)}",
+        f"IRGenerator object: {object_summary(ir_gen)}",
+        f"IRGenerator gen: {safe_repr(getattr(ir_gen, 'gen', None))}",
+        "",
+        *format_mapping("JITFunc arg_names", {idx: name for idx, name in enumerate(getattr(jit_func, "arg_names", []) or [])}),
+        "",
+        *format_mapping("JITFunc tensor_args", getattr(jit_func, "tensor_args", None)),
+        "",
+        *format_mapping("JITFunc tensor_args_defaults", getattr(jit_func, "tensor_args_defaults", None)),
+        "",
+        *format_mapping("IRGenerator extra_type_hints", getattr(ir_gen, "extra_type_hints", None)),
+        "",
+    ]
+    dumper.dump_text(
+        "ir_generator_02_metadata",
+        "\n".join(metadata_lines),
+        "Metadata that controls how IRGenerator phase1/phase2 maps Python arguments and type hints into TIR.",
+    )
+
+
+def dump_ir_generator_runtime_state(args: argparse.Namespace, dumper: ArtifactDumper) -> None:
+    if not args.dump_ir_generator or dumper.dumped_ir_generator_runtime:
+        return
+    dumper.dumped_ir_generator_runtime = True
+
+    jit_func = getattr(matmul, "func", None)
+    p1_cache = getattr(jit_func, "p1_cache", None)
+    if not p1_cache:
+        dumper.dump_text(
+            "ir_generator_03_runtime_state",
+            "No phase1 template cache entries were found after matmul.get_tir(...).\n",
+            "IRGenerator runtime cache state after frontend TIR generation.",
+        )
+        return
+
+    lines = ["# IRGenerator Runtime State", ""]
+    for index, (key, template) in enumerate(p1_cache.items()):
+        lines.extend(
+            [
+                f"## Phase1 template {index}",
+                f"cache_key: {safe_repr(key)}",
+                f"name: {safe_repr(getattr(template, 'name', None))}",
+                f"is_lazy_style: {safe_repr(getattr(template, 'is_lazy_style', None))}",
+                f"constexprs: {safe_repr(getattr(template, 'constexprs', None))}",
+                f"matcher: {safe_repr(getattr(template, 'matcher', None))}",
+                "",
+            ]
+        )
+    dumper.dump_text(
+        "ir_generator_03_runtime_state",
+        "\n".join(lines),
+        "Phase1 TirTemplate cache and constexpr matcher state after matmul.get_tir(...).",
+    )
+
+    first_template = next(iter(p1_cache.values()))
+    phase1_prim_func = getattr(first_template, "prim_func", None)
+    if phase1_prim_func is not None:
+        dumper.dump_module(
+            "ir_generator_04_phase1_template_primfunc",
+            phase1_prim_func,
+            "Phase1 template PrimFunc before phase2 constexpr/tensor-shape substitution produces the frontend module.",
+        )
+
+
 def build_initial_module(args: argparse.Namespace) -> tuple[tvm.IRModule, Any]:
     prim_func = matmul.get_tir(
         M=args.M,
@@ -182,7 +503,109 @@ def build_initial_module(args: argparse.Namespace) -> tuple[tvm.IRModule, Any]:
     return module, params
 
 
+def call_public_lower(tilelang_lower: Callable[..., Any], prim_func: Any, target: Target, target_host: Target) -> Any:
+    try:
+        return tilelang_lower(
+            prim_func,
+            target=target,
+            target_host=target_host,
+            enable_host_codegen=False,
+            enable_device_compile=False,
+        )
+    except TypeError as err:
+        try:
+            return tilelang_lower(prim_func, target=target, target_host=target_host)
+        except TypeError:
+            raise err
+
+
+def dump_public_lowering(args: argparse.Namespace, dumper: ArtifactDumper, pass_configs: dict[str, Any]) -> None:
+    fallback_configs = dict(pass_configs)
+    dump_ir_dir = dumper.out_dir / "tvm_dump_ir"
+    fallback_configs[pass_config_key("TL_ENABLE_DUMP_IR", "tl.enable_dump_ir")] = True
+    fallback_configs[pass_config_key("TL_DUMP_IR_DIR", "tl.dump_ir_path")] = str(dump_ir_dir)
+
+    dumper.dump_text(
+        "00_public_dumpir_fallback",
+        "\n".join(
+            [
+                "Manual pass-by-pass mode is unavailable because this TVM package does not provide tvm.tirx.",
+                f"Original import error: {_TIRX_IMPORT_ERROR!r}",
+                "Falling back to tilelang.lower under TVM DumpIR instrumentation.",
+                f"TVM DumpIR directory: {dump_ir_dir}",
+                "",
+            ]
+        ),
+        "The installed TileLang/TVM version lacks tvm.tirx, so this run follows the public lowering path.",
+    )
+
+    target = make_cuda_target(args.arch)
+    target_host = Target(canon_target_host(target, args.target_host))
+    target = Target(target, target_host)
+    pass_instruments = []
+    dump_ir = getattr(tvm.ir.instrument, "DumpIR", None)
+    if dump_ir is not None:
+        pass_instruments.append(dump_ir(dump_dir=str(dump_ir_dir)))
+
+    with tilelang.transform.PassContext(opt_level=3, config=fallback_configs, instruments=pass_instruments), target:
+        dump_ir_generator_artifacts(args, dumper)
+        module, params = build_initial_module(args)
+        dump_ir_generator_runtime_state(args, dumper)
+        prim_func = next(iter(module.functions.values()))
+        dumper.dump_module(
+            "01_frontend_primfunc",
+            module,
+            "Eager JIT/AST builder output before public TileLang lowering.",
+        )
+        dumper.dump_text(
+            "02_kernel_params",
+            "\n".join(str(param) for param in params) + "\n",
+            "Kernel parameters extracted from the frontend PrimFunc buffer map and scalar args.",
+        )
+
+        tilelang_lower = getattr(tilelang, "lower", None)
+        if tilelang_lower is None:
+            raise RuntimeError("This TileLang package does not expose tilelang.lower, so public DumpIR fallback cannot run.")
+
+        artifact = call_public_lower(tilelang_lower, prim_func, target, target_host)
+
+    if hasattr(artifact, "host_mod"):
+        dumper.dump_module("03_public_host_module", artifact.host_mod, "Host module returned by tilelang.lower.")
+    if hasattr(artifact, "device_mod"):
+        dumper.dump_module("04_public_device_module", artifact.device_mod, "Device module returned by tilelang.lower.")
+    kernel_source = getattr(artifact, "kernel_source", None)
+    if kernel_source is not None:
+        dumper.dump_text(
+            "05_public_generated_source",
+            str(kernel_source),
+            "Kernel source returned by tilelang.lower without device compilation.",
+            suffix=".cu",
+        )
+
+    dumper.dump_manifest(
+        {
+            "mode": "public_dumpir_fallback",
+            "missing_tirx": repr(_TIRX_IMPORT_ERROR),
+            "M": args.M,
+            "N": args.N,
+            "K": args.K,
+            "block_M": args.block_M,
+            "block_N": args.block_N,
+            "block_K": args.block_K,
+            "target": "cuda",
+            "arch": args.arch,
+            "target_host": str(target_host),
+            "pass_configs": fallback_configs,
+            "dump_ir_dir": str(dump_ir_dir),
+        }
+    )
+
+
 def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_configs: dict[str, Any]) -> None:
+    if tirx is None:
+        dump_public_lowering(args, dumper, pass_configs)
+        return
+
     target = make_cuda_target(args.arch)
     target_host = Target(canon_target_host(target, args.target_host))
     target = Target(target, target_host)
@@ -192,7 +615,9 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
     pass_context = tilelang.transform.PassContext(opt_level=3, config=pass_configs, instruments=pass_instruments)
 
     with pass_context, target:
+        dump_ir_generator_artifacts(args, dumper)
         module, params = build_initial_module(args)
+        dump_ir_generator_runtime_state(args, dumper)
         dumper.dump_module(
             "00_frontend_primfunc",
             module,
@@ -277,7 +702,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
                 dumper,
                 "11_producer_consumer_warp_specialized",
                 module,
-                tilelang.transform.ProducerConsumerWarpSpecialized,
+                tilelang.cuda.transform.ProducerConsumerWarpSpecialized,
                 "Optional Hopper+ warp specialization while tile ops are still high level.",
             )
 
@@ -285,7 +710,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "12_lower_blackwell_2sm",
             module,
-            tilelang.transform.LowerBlackwell2SM,
+            tilelang.cuda.transform.LowerBlackwell2SM,
             "Handles Blackwell 2CTA/2SM GEMM annotations before LayoutInference.",
         )
         module = run_pass(
@@ -492,7 +917,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "41_renormalize_split_pattern",
             module,
-            s_tir.transform.RenormalizeSplitPattern,
+            tvm_transform("RenormalizeSplitPattern"),
             "Normalizes split-loop patterns after unrolling and simplification.",
         )
         module = run_pass(
@@ -513,7 +938,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "44_hoist_if_then_else",
             module,
-            s_tir.transform.HoistIfThenElse,
+            tvm_transform("HoistIfThenElse"),
             "Hoists suitable if-then-else constructs for cleaner lowered IR.",
         )
         module = run_pass(
@@ -534,7 +959,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "47_infer_fragment",
             module,
-            s_tir.transform.InferFragment,
+            tvm_transform("InferFragment"),
             "Infers fragment-related metadata needed by thread-level reductions.",
         )
         module = run_pass(
@@ -576,7 +1001,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "53_mark_cuda_sync_calls",
             module,
-            lambda: tilelang.transform.MarkCudaSyncCalls(have_pdl(target)),
+            lambda: tilelang.cuda.transform.MarkCudaSyncCalls(_have_pdl(target)),
             "Marks CUDA sync calls such as PDL sync/trigger when the architecture supports them.",
         )
         module = run_pass(
@@ -779,6 +1204,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also enable TVM DumpIR instrument into OUT_DIR/tvm_dump_ir for comparison with the manual dumps.",
     )
+    parser.add_argument(
+        "--no-dump-ir-generator",
+        dest="dump_ir_generator",
+        action="store_false",
+        help="Do not dump TileLang eager IRGenerator source/metadata artifacts before lowering.",
+    )
+    parser.set_defaults(dump_ir_generator=True)
     parser.add_argument("--skip-codegen", action="store_true", help="Stop after host/device IR dumps and skip CUDA source generation.")
     return parser.parse_args()
 
@@ -792,8 +1224,8 @@ def main() -> None:
 
     pass_configs = load_pass_configs(args.pass_config_json)
     if args.enable_dump_ir_instrument:
-        pass_configs[PassConfigKey.TL_ENABLE_DUMP_IR.value] = True
-        pass_configs[PassConfigKey.TL_DUMP_IR_DIR.value] = str(out_dir / "tvm_dump_ir")
+        pass_configs[pass_config_key("TL_ENABLE_DUMP_IR", "tl.enable_dump_ir")] = True
+        pass_configs[pass_config_key("TL_DUMP_IR_DIR", "tl.dump_ir_path")] = str(out_dir / "tvm_dump_ir")
 
     dumper = ArtifactDumper(out_dir, print_ir=args.print_ir)
     dump_cuda_pipeline(args, dumper, pass_configs)

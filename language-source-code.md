@@ -3349,6 +3349,98 @@ tilelang.jit.jit(...)
 - `mutate(func)` 会把原始 Python 函数的 AST 改写成一个 IR 生成函数。
 - `prim_func(..., eager_jit=True)` 这一步不会立刻生成 `PrimFunc`，而是先返回 `JITFunc`，把真正的 IR 构建延迟到函数第一次调用时。
 
+### C.2.1 `@tilelang.jit` 的源码入口速查
+
+如果想直接路由源码阅读，`@tilelang.jit` 的真正入口是：
+
+```text
+tilelang/jit/__init__.py::jit(...)
+```
+
+顶层 `tilelang.jit` 是在 `tilelang/__init__.py` 中导出的：
+
+```python
+from .jit import jit, JITKernel, compile, par_compile
+```
+
+所以：
+
+```python
+import tilelang
+
+@tilelang.jit
+def kernel(...):
+    ...
+```
+
+等价于：
+
+```python
+kernel = tilelang.jit(kernel)
+```
+
+装饰阶段的完整主链路可以写成：
+
+```text
+tilelang.jit
+    -> tilelang/jit/__init__.py::jit()
+    -> decorator(func)
+    -> tilelang.language.eager.builder::prim_func(func, eager_jit=True)
+    -> tilelang.language.eager.ast::mutate(func)
+    -> 返回 JITFunc
+    -> 包成 JITImpl
+```
+
+对应的重点源码位置：
+
+| 阶段 | 入口 |
+| --- | --- |
+| 顶层导出 | `tilelang/__init__.py` 中导出 `jit` |
+| 装饰器入口 | `tilelang/jit/__init__.py::jit` |
+| 创建 wrapper | `tilelang/jit/__init__.py::decorator` |
+| 生成 `JITFunc` | `tilelang/language/eager/builder.py::prim_func(..., eager_jit=True)` |
+| AST 改写 | `tilelang/language/eager/ast.py::mutate` |
+| 返回包装对象 | `tilelang/jit/__init__.py::JITImpl` |
+
+当用户调用被装饰后的函数时，例如：
+
+```python
+kernel(A, B)
+```
+
+实际走的是：
+
+```text
+JITImpl.__call__()
+    -> JITImpl._infer_jit_mode()
+    -> JITFunc._is_lazy_style()
+    -> JITFunc.parse_args()
+    -> JITImpl.compile()
+    -> JITImpl.get_tir()
+    -> JITFunc.get_tir()
+    -> TirTemplate.get_tir()
+    -> Builder 重新执行改写后的 Python DSL
+    -> 得到 PrimFunc
+    -> tilelang.jit.compile()
+    -> tilelang.cache.cached()
+    -> KernelCache.cached()
+    -> JITKernel(...)
+    -> JITKernel._compile_and_create_adapter()
+    -> tilelang.lower(...)
+```
+
+这条链里，`tilelang/jit/` 负责 wrapper、cache、compile、执行策略；`tilelang/language/eager/` 负责把 Python DSL 变成 `PrimFunc`；`tilelang/engine/lower.py` 和 backend pipeline 负责把 `PrimFunc` 继续 lowering 到目标代码。
+
+建议按这个顺序读：
+
+1. `tilelang/jit/__init__.py::jit`
+2. `tilelang/language/eager/builder.py::prim_func`
+3. `tilelang/language/eager/ast.py::mutate`
+4. `tilelang/jit/__init__.py::JITImpl.__call__`
+5. `tilelang/language/eager/builder.py::JITFunc._build_tir_template`
+6. `tilelang/language/eager/builder.py::TirTemplate.get_tir`
+7. `tilelang/jit/kernel.py::JITKernel._compile_and_create_adapter`
+
 ### C.3 调用阶段：先判定 lazy/eager，再生成 PrimFunc
 
 当用户第一次调用 `foo(...)` 时，主链路是：

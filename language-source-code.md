@@ -3441,6 +3441,408 @@ JITImpl.__call__()
 6. `tilelang/language/eager/builder.py::TirTemplate.get_tir`
 7. `tilelang/jit/kernel.py::JITKernel._compile_and_create_adapter`
 
+### C.2.2 为什么调用 kernel 时才执行 `JITImpl.__call__()`
+
+`@tilelang.jit` 这个装饰器本质上做的是 **把 Python 函数变成一个可 JIT 的 callable wrapper**，而不是在定义函数时立刻编译 kernel。
+
+也就是说：
+
+```python
+@tilelang.jit
+def kernel(A, B, block_M=64):
+    ...
+```
+
+等价于：
+
+```python
+kernel = tilelang.jit(kernel)
+```
+
+这一步发生在 **模块 import / 函数定义阶段**。此时通常还没有真实输入 `A/B`，也不知道真实 shape、stride、target、cache key、某些编译期参数组合。所以这里只能 wrap，不能贸然生成最终 kernel。
+
+核心原因有几个。
+
+#### 定义函数时没有调用参数
+
+eager style 里常写：
+
+```python
+@tilelang.jit
+def kernel(A, B):
+    M, N = T.const("M, N")
+    A: T.Tensor((M, N), T.float16)
+    ...
+```
+
+`M/N` 要从真实 tensor 的 shape 推出来。只有用户真正调用：
+
+```python
+kernel(A_real, B_real)
+```
+
+时，TileLang 才知道：
+
+```text
+A_real.shape
+A_real.stride
+B_real.shape
+B_real.stride
+```
+
+所以最终 `PrimFunc` 不能在装饰阶段确定。
+
+#### JIT 编译依赖 cache key
+
+`JITImpl.__call__()` 里会根据调用参数生成 key：
+
+```text
+compile-time args
+runtime tensor args
+tune params
+lazy/eager mode
+target/backend/pass configs
+```
+
+然后查 `_kernel_cache` 或 frontend cache。如果装饰阶段就编译，那只能编译一个“不知道参数”的版本，很多 shape-specialized kernel 就没法做。
+
+#### 一个 Python 函数可以生成多个 kernel
+
+比如：
+
+```python
+@tilelang.jit
+def matmul(A, B, block_M: int, block_N: int, block_K: int):
+    ...
+```
+
+用户可能这样调用：
+
+```python
+matmul(A, B, 64, 64, 32)
+matmul(A, B, 128, 64, 64)
+```
+
+这两个调用应该生成不同的 kernel，或者至少不同 cache entry。所以 `@tilelang.jit` 装饰阶段只能保存原函数和配置；真正调用时再按参数 specialize。
+
+#### lazy/eager 模式要到调用时才能稳妥判断
+
+TileLang 支持两种风格：
+
+```python
+# lazy style
+@tilelang.jit
+def make_kernel(M, N):
+    @T.prim_func
+    def kernel(...):
+        ...
+    return kernel
+```
+
+和：
+
+```python
+# eager style
+@tilelang.jit
+def kernel(A, B):
+    M, N = T.const("M, N")
+    ...
+```
+
+`JITImpl.__call__()` 里会做：
+
+```text
+JITImpl._infer_jit_mode()
+    -> JITFunc._is_lazy_style()
+```
+
+它需要尝试绑定/调用参数，判断原函数是不是能直接返回 `PrimFunc`。这个判断放在调用阶段更自然，因为调用阶段才有用户传入的参数。
+
+#### 避免 import 时重编译
+
+如果装饰阶段就编译，那么只要 import 一个 Python 文件，就可能触发大量 TVM lowering、CUDA 编译、NVRTC/NVCC 编译。这样会导致：
+
+```text
+import 模块很慢
+没有用到的 kernel 也被编译
+autotune/benchmark 前无法灵活控制配置
+多 target/backend 切换困难
+```
+
+JIT wrapper 延迟到第一次调用，符合“用到哪个 kernel，才编译哪个 kernel”的语义。
+
+#### eager JIT 本身就是两阶段
+
+eager style 大致是：
+
+```text
+装饰阶段：
+    jit(func)
+    -> mutate(func)
+    -> 保存 JITFunc/JITImpl
+
+第一次调用：
+    JITImpl.__call__()
+    -> phase1: 构造模板 PrimFunc，收集 constexpr matcher
+    -> phase2: 根据真实 tensor shape/stride 生成最终 PrimFunc
+    -> compile/cache
+    -> eager 模式下立即执行 kernel
+```
+
+所以装饰阶段只 wrap，不实际构造最终 kernel，是为了给 phase1/phase2 留出真实调用上下文。
+
+一句话总结：
+
+```text
+@tilelang.jit 装饰阶段只登记“怎么生成 kernel”；
+JITImpl.__call__ 调用阶段才知道“要为哪些参数、shape、target、配置生成哪个 kernel”。
+```
+
+因此，`@tilelang.jit` 的核心不是“定义时编译”，而是“把函数变成一个按调用参数 specialization、缓存、编译、执行的 JIT wrapper”。
+
+### C.2.3 lazy 模式什么时候使用，和 eager 有什么差异
+
+lazy 模式适合这种情况：把 `@tilelang.jit` 装饰的函数当成 **kernel factory**，先根据编译期参数生成/编译一个 kernel object，然后后面再手动调用这个 kernel。
+
+典型 lazy style：
+
+```python
+@tilelang.jit(out_idx=[-1])
+def make_matmul(M, N, K, block_M, block_N, block_K):
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((M, K), T.float16),
+        B: T.Tensor((K, N), T.float16),
+        C: T.Tensor((M, N), T.float16),
+    ):
+        with T.Kernel(...):
+            ...
+
+    return kernel
+```
+
+使用时是两步：
+
+```python
+matmul_kernel = make_matmul(1024, 1024, 1024, 128, 128, 32)
+C = matmul_kernel(A, B)
+```
+
+eager style 则通常是一体式：
+
+```python
+@tilelang.jit
+def matmul(A, B, block_M=128, block_N=128, block_K=32):
+    M, N, K = T.const("M, N, K")
+    A: T.Tensor((M, K), T.float16)
+    B: T.Tensor((K, N), T.float16)
+    C = T.empty((M, N), T.float16)
+
+    with T.Kernel(...):
+        ...
+
+    return C
+```
+
+使用时直接：
+
+```python
+C = matmul(A, B)
+```
+
+关键差异是：
+
+```text
+lazy:
+    调用 @tilelang.jit wrapper
+        -> 返回 JITKernel 对象
+    再调用 JITKernel
+        -> 执行 kernel
+
+eager:
+    调用 @tilelang.jit wrapper
+        -> 生成/编译 kernel
+        -> 立刻执行 kernel
+        -> 返回输出
+```
+
+源码上也很直接，`JITImpl.__call__()` 最后会分支：
+
+```python
+if self.mode == "eager":
+    return kernel(*kernel_args.values())
+else:
+    return kernel
+```
+
+所以如果觉得“调用 kernel 的时候跟 eager 没区别”，通常是因为对比的是 lazy 的第二步：
+
+```python
+matmul_kernel(A, B)
+```
+
+和 eager 的：
+
+```python
+matmul(A, B)
+```
+
+最终它们都会调用编译好的 adapter。但它们不是同一层调用：
+
+```text
+eager 的 matmul(A, B)
+    是 JITImpl.__call__，里面会 compile/cache，然后立即执行
+
+lazy 的 matmul_kernel(A, B)
+    是 JITKernel.__call__，它已经是编译后的 kernel object，只负责执行
+```
+
+lazy 更适合：
+
+- 想显式拿到 kernel object。
+- 想先 compile，再多次调用。
+- 想 inspect `PrimFunc` / kernel source / benchmark。
+- 编译期参数很多，比如 `M/N/K/block_M/block_N/block_K/num_stages/threads`。
+- 外层函数天然是“生成一个内部 `@T.prim_func`”。
+- 想用 `out_idx` 指定输出参数位置。
+
+eager 更适合：
+
+- 写法更像普通 Python 函数。
+- 输入 tensor 直接作为函数参数。
+- shape/stride 通过 `T.const()` 从真实 tensor 推导。
+- 输出通过 `T.empty()` 声明并 `return`。
+- 希望调用函数时直接得到输出结果。
+
+可以用一句话区分：
+
+```text
+lazy 模式：@tilelang.jit 函数返回“编译好的 kernel”。
+eager 模式：@tilelang.jit 函数直接执行 kernel 并返回结果。
+```
+
+更深一层：
+
+```text
+lazy 的用户函数是 kernel factory；
+eager 的用户函数是 kernel invocation interface。
+```
+
+所以 lazy/eager 最核心的区别不是底层执行 kernel 时的 CUDA 调用有什么不同，而是 **Python API 边界、参数 specialization 边界、输出处理方式、以及用户是否拿到 JITKernel 对象** 不同。
+
+### C.2.4 lazy 不是 decorator 阶段编译，而是显式拆分编译和执行
+
+一个常见误解是：lazy mode 会不会在 decorator 那一行就提前编译 kernel？
+
+答案是：不会。
+
+更准确地说：
+
+```text
+lazy mode 不是在 decorator 那一行提前编译。
+lazy mode 是在第一次调用 @tilelang.jit wrapper 的时候编译，然后返回 JITKernel。
+```
+
+也就是说，不是这里编译：
+
+```python
+@tilelang.jit(out_idx=[-1])
+def make_kernel(...):
+    ...
+```
+
+这一步只是 wrap。真正编译发生在这里：
+
+```python
+kernel = make_kernel(M, N, K, block_M, block_N, block_K)
+```
+
+这行会走：
+
+```text
+JITImpl.__call__()
+    -> 生成 PrimFunc
+    -> compile/cache
+    -> 返回 JITKernel
+```
+
+然后这行才是真正执行已经编译好的 kernel：
+
+```python
+C = kernel(A, B)
+```
+
+所以 lazy 的准确时间线是：
+
+```text
+定义函数 / decorator 阶段:
+    只 wrap，不编译
+
+调用 factory:
+    make_kernel(...)
+        -> 编译或查缓存
+        -> 返回 JITKernel
+
+调用 kernel:
+    kernel(A, B)
+        -> 只执行已编译 kernel
+```
+
+eager 的时间线是：
+
+```text
+定义函数 / decorator 阶段:
+    只 wrap，不编译
+
+调用函数:
+    matmul(A, B)
+        -> 编译或查缓存
+        -> 立刻执行 kernel
+        -> 返回结果
+```
+
+因此，lazy 不是“decorator 时更勤奋”，而是：
+
+```text
+lazy 把“编译”和“执行”拆成两步，让用户可以显式提前编译。
+```
+
+例如：
+
+```python
+kernel = make_kernel(1024, 1024, 1024, 128, 128, 32)  # 这里编译
+
+# 做别的准备工作
+C1 = kernel(A1, B1)  # 这里只执行
+C2 = kernel(A2, B2)  # 这里只执行
+```
+
+这就是 lazy 的价值：用户可以先拿到 `JITKernel`，后面重复调用，不把编译混在每次业务调用里。
+
+不过有 cache 的情况下，eager 也不是每次都重新编译：
+
+```python
+C1 = matmul(A1, B1)  # 第一次可能编译
+C2 = matmul(A2, B2)  # shape/config 相同则查缓存后执行
+```
+
+区别仍然是 API 边界：
+
+```text
+lazy:
+    用户显式拿到 compiled kernel object
+
+eager:
+    wrapper 管理 compile/cache，并直接返回执行结果
+```
+
+一句话总结：
+
+```text
+lazy 是“显式预编译 + 手动执行”；
+eager 是“调用时自动编译/缓存/执行”。
+```
+
 ### C.3 调用阶段：先判定 lazy/eager，再生成 PrimFunc
 
 当用户第一次调用 `foo(...)` 时，主链路是：

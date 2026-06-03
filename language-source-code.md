@@ -3843,6 +3843,206 @@ lazy 是“显式预编译 + 手动执行”；
 eager 是“调用时自动编译/缓存/执行”。
 ```
 
+### C.2.5 `builder.py::prim_func` 中 `eager_jit` 两个分支为什么返回不同对象
+
+`tilelang/language/eager/builder.py::prim_func(...)` 里有一个关键分支：
+
+```python
+if eager_jit:
+    arg_names = list(sig.parameters.keys())
+    tensor_args = {k: v for k, v in annot.items() if isinstance(v, (Buffer, Var))}
+    tensor_args_defaults = {
+        k: sig.parameters[k].default for k in tensor_args if sig.parameters[k].default is not sig.parameters[k].empty
+    }
+    return JITFunc(func, arg_names, tensor_args, tensor_args_defaults, ir_gen)
+else:
+    try:
+        builder = Builder()
+        with builder.prim_func(func.__name__):
+            ir_gen.gen(builder)(**annot)
+        prim_func = builder.get()
+        prim_func = _patch_prim_func_attrs(prim_func, builder)
+        prim_func.orig_func = func
+        return prim_func
+```
+
+这段代码的核心区别是：
+
+```text
+eager_jit=True:
+    不立即构造 PrimFunc
+    返回 JITFunc
+    以后由 @tilelang.jit wrapper 在调用时生成/编译/执行
+
+eager_jit=False:
+    立即执行 IRGenerator
+    立刻构造 PrimFunc
+    返回 PrimFunc
+```
+
+这里的 `eager_jit` 名字容易误解。它不是简单等价于“eager style vs lazy style”，而是表示：
+
+```text
+这个 prim_func 是不是被 @tilelang.jit 当成外层 JIT 函数来包装？
+```
+
+#### `eager_jit=True`：给 `@tilelang.jit` 用
+
+入口来自：
+
+```python
+@tilelang.jit
+def kernel(...):
+    ...
+```
+
+装饰阶段会调用：
+
+```python
+pf = prim_func(func, eager_jit=True)
+```
+
+这个分支只收集元信息：
+
+- `arg_names`：原函数参数顺序，用来把 positional args 合并进 kwargs。
+- `tensor_args`：哪些参数 annotation 是 `Buffer/Var`，也就是运行时 tensor 参数。
+- `tensor_args_defaults`：tensor 参数有没有默认值。
+- `ir_gen`：AST 改写后的 IR 生成器。
+
+然后返回 `JITFunc`。
+
+为什么不直接构造 `PrimFunc`？因为 `@tilelang.jit` 外层函数可能需要等真实调用参数才能确定：
+
+```python
+matmul(A, B, block_M=128)
+```
+
+尤其 eager style 里：
+
+```python
+M, N = T.const("M, N")
+A: T.Tensor((M, N), T.float16)
+```
+
+`M/N` 要从真实 `A.shape` 推出来，所以装饰阶段只能返回一个“以后能生成 PrimFunc 的对象”。
+
+所以 `JITFunc` 可以理解成：
+
+```text
+延迟版 PrimFunc factory
+```
+
+它后面会被 `JITImpl` 调用：
+
+```text
+JITImpl.__call__()
+    -> JITFunc.parse_args()
+    -> JITFunc.get_tir()
+    -> phase1/phase2
+    -> PrimFunc
+```
+
+#### `eager_jit=False`：给 `@T.prim_func` 用
+
+入口通常是：
+
+```python
+@T.prim_func
+def kernel(A: T.Tensor(...), B: T.Tensor(...)):
+    ...
+```
+
+或者 lazy style 内部：
+
+```python
+@tilelang.jit
+def make_kernel(M, N):
+    @T.prim_func
+    def kernel(...):
+        ...
+    return kernel
+```
+
+这里 `@T.prim_func` 会调用：
+
+```python
+prim_func(func, eager_jit=False)
+```
+
+然后立即构造 TIR：
+
+1. 创建 `Builder()`。
+2. 进入 `builder.prim_func(...)`，打开 `IRBuilder` 的 `PrimFuncFrame`。
+3. 执行 AST 改写后的函数：`ir_gen.gen(builder)(**annot)`。
+4. 改写后的函数体调用 `builder.arg / bind / ctx_for / ctx_if / ctx_with / eval / ret`。
+5. 这些调用往 `IRBuilder` 写入 TIR/TIRX 节点。
+6. `builder.get()` 返回真正的 `PrimFunc`。
+7. `_patch_prim_func_attrs(...)` 把 `out_idx/pass_configs/compile_flags` 写到 `PrimFunc.attrs`。
+8. 返回 `PrimFunc`。
+
+所以这个分支是“现在就构造 PrimFunc”。
+
+#### 为什么两个分支返回不一样
+
+因为它们服务的调用场景不同：
+
+```text
+@T.prim_func:
+    用户明确在定义一个 PrimFunc
+    所以装饰时就可以返回 PrimFunc
+
+@tilelang.jit:
+    用户在定义一个 JIT wrapper
+    它可能根据不同调用参数生成不同 PrimFunc/kernel
+    所以装饰时返回 JITFunc，等调用时再生成 PrimFunc
+```
+
+lazy style 里会同时出现两层：
+
+```python
+@tilelang.jit
+def make_kernel(M, N):
+    @T.prim_func
+    def kernel(A: T.Tensor((M, N), T.float16)):
+        ...
+    return kernel
+```
+
+发生的是：
+
+```text
+外层 @tilelang.jit:
+    prim_func(make_kernel, eager_jit=True)
+    -> 返回 JITFunc
+    -> 包成 JITImpl
+
+第一次调用 make_kernel(M, N):
+    JITImpl.__call__
+    -> 原函数 make_kernel(M, N) 被调用
+    -> 内层 @T.prim_func 执行
+
+内层 @T.prim_func:
+    prim_func(kernel, eager_jit=False)
+    -> 立即构造 PrimFunc
+    -> return kernel
+```
+
+所以：
+
+```text
+外层 @tilelang.jit 返回 JITFunc/JITImpl，是延迟 JIT wrapper。
+内层 @T.prim_func 返回 PrimFunc，是立即构造好的 TIR 函数。
+```
+
+一句话总结：
+
+```text
+eager_jit=True 分支：返回“以后能生成 PrimFunc 的 JITFunc”。
+eager_jit=False 分支：现在就用 Builder 生成并返回 PrimFunc。
+```
+
+这段代码是 `@tilelang.jit` 和 `@T.prim_func` 两条入口复用同一个 `prim_func()` 实现的分叉点。
+
 ### C.3 调用阶段：先判定 lazy/eager，再生成 PrimFunc
 
 当用户第一次调用 `foo(...)` 时，主链路是：

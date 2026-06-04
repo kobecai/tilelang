@@ -86,6 +86,226 @@ for __0 in __tb.ctx_if(acc > limit):
 控制流骨架；`__tb` builder 决定 `bind`、`ctx_for`、`ctx_if`、`ctx_then`、
 `ctx_else`、`ret` 的具体含义。
 
+## `NodeTransformer.visit()` 如何调用各个 `visit_xxx` 方法
+
+demo 里的核心调用是：
+
+```python
+tree = ToyDSLMutator().visit(tree)
+```
+
+这里的 `visit()` 不是 `ToyDSLMutator` 自己定义的，而是继承自
+`ast.NodeTransformer`。它会根据当前 AST 节点的类型，动态拼出要调用的方法名：
+
+```python
+method_name = "visit_" + node.__class__.__name__
+```
+
+比如：
+
+- 当前节点是 `ast.FunctionDef`，就尝试调用 `visit_FunctionDef(node)`
+- 当前节点是 `ast.For`，就尝试调用 `visit_For(node)`
+- 当前节点是 `ast.If`，就尝试调用 `visit_If(node)`
+- 当前节点是 `ast.Assign`，就尝试调用 `visit_Assign(node)`
+
+可以把它粗略理解成下面这个简化版：
+
+```python
+def visit(self, node):
+        method_name = "visit_" + node.__class__.__name__
+        visitor = getattr(self, method_name, self.generic_visit)
+        return visitor(node)
+```
+
+所以不需要手动写：
+
+```python
+mutator.visit_FunctionDef(...)
+mutator.visit_For(...)
+mutator.visit_Assign(...)
+```
+
+只要从根节点调用一次：
+
+```python
+mutator.visit(tree)
+```
+
+`NodeTransformer` 就会在递归遍历 AST 时，自动把不同类型的节点分发给对应的
+`visit_xxx` 方法。
+
+## 是否必须实现所有 AST 节点的 `visit_xxx`
+
+不需要。一个 mutator 只需要实现自己关心、想改写的节点类型。
+
+这个 demo 只实现了：
+
+```python
+visit_FunctionDef
+visit_Assign
+visit_For
+visit_If
+visit_Expr
+visit_Return
+```
+
+也就是说，它只特殊处理函数定义、赋值、`for`、`if`、表达式语句和 `return`。
+像 `Module`、`BinOp`、`Call`、`Name`、`Constant`、`Compare` 这些节点没有专门的
+`visit_xxx` 方法，就会走默认的 `generic_visit()`。
+
+Python AST 节点类型由 Python 语法定义，是有限的一批，但不止几个。常见的有：
+
+```text
+Module
+FunctionDef
+ClassDef
+Return
+Assign
+AnnAssign
+AugAssign
+For
+While
+If
+With
+Try
+Expr
+Call
+Name
+Constant
+BinOp
+UnaryOp
+Compare
+BoolOp
+Attribute
+Subscript
+List
+Tuple
+Dict
+Lambda
+Import
+ImportFrom
+```
+
+还有更细的节点或 AST 辅助对象，比如 `Add`、`Sub`、`Gt`、`Load`、`Store` 等。
+实际写 DSL mutator 时，通常不会全部处理，只会处理 DSL 语义需要拦截的那部分。
+
+## `generic_visit()` 对未自定义节点做什么
+
+`generic_visit(node)` 可以理解成默认递归器。它对当前节点本身不做特殊改写，
+但会继续访问当前节点里面的子节点：
+
+```text
+generic_visit(node)
+    遍历 node 的每个字段
+    如果字段里有 AST 子节点，就对子节点调用 self.visit(child)
+    如果 child 被改写了，就把新的 child 放回去
+    最后返回当前 node
+```
+
+所以它不是完全什么都不做，而是：当前节点默认保留，里面的孩子仍然有机会被
+自定义的 `visit_xxx` 改写。
+
+例如原代码：
+
+```python
+def toy_kernel(n, limit):
+        acc = 0
+        return acc + limit
+```
+
+AST 大致是：
+
+```text
+Module
+    FunctionDef
+        arguments
+        Assign
+        Return
+            BinOp
+                Name("acc")
+                Add
+                Name("limit")
+```
+
+这个 demo 没有实现 `visit_Module`、`visit_arguments`、`visit_BinOp`、
+`visit_Name`、`visit_Add`，但是实现了 `visit_FunctionDef`、`visit_Assign`、
+`visit_Return`。
+
+遍历流程可以理解成：
+
+```text
+visit(Module)
+    没有 visit_Module
+    调用 generic_visit(Module)
+
+    generic_visit(Module) 进入 body
+        visit(FunctionDef)
+            有 visit_FunctionDef，改写函数签名并继续遍历函数体
+
+            visit(Assign)
+                有 visit_Assign，把 acc = 0 改写成 __tb.bind(...)
+
+            visit(Return)
+                有 visit_Return
+                Return 里的 BinOp 没有自定义 visit_BinOp，所以 BinOp 原样保留
+                最后把 return value 包成 __tb.ret(value)
+```
+
+最后改写结果大致是：
+
+```python
+def toy_kernel(__tb, n, limit):
+        range = __tb.override('range')
+        acc = __tb.bind('acc', 0)
+        return __tb.ret(acc + limit)
+```
+
+注意这里的：
+
+```python
+acc + limit
+```
+
+对应的是 `BinOp`。因为 demo 没有实现 `visit_BinOp`，所以这个表达式本身保持原样；
+它只是被外层的 `visit_Return` 包进了 `__tb.ret(...)`。
+
+再看一个赋值表达式的例子：
+
+```python
+x = foo(y + 1)
+```
+
+AST 大致是：
+
+```text
+Assign
+    target: Name("x")
+    value: Call
+        func: Name("foo")
+        args:
+            BinOp
+                Name("y")
+                Add
+                Constant(1)
+```
+
+因为 demo 有 `visit_Assign`，外层赋值会被改写：
+
+```python
+x = __tb.bind('x', foo(y + 1))
+```
+
+但 demo 没有 `visit_Call`、`visit_BinOp`、`visit_Name`、`visit_Constant`，所以：
+
+```python
+foo(y + 1)
+```
+
+这部分表达式本身保持原样。
+
+一句话总结：`generic_visit()` 对当前节点默认保留原样，但会继续深入它的子节点，
+让那些有自定义 `visit_xxx` 的子节点被改写。
+
 ## 为什么 `compile()` 后还要 `exec()` 才能得到 function object
 
 这是 Python 底层执行模型里一个容易混淆的点：`compile()` 不会直接创建函数对象。

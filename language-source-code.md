@@ -771,6 +771,163 @@ class IRGenerator:
 
 当前实现还会收集 `extra_type_hints`。这主要服务 eager 函数参数：如果函数体里写了参数 annotation，例如 `A: T.Tensor(...)` 或 `A: T.float32`，mutator 会把这些类型信息保存下来，后续 `prim_func(..., eager_jit=True)` 用它识别哪些参数是 tensor/buffer 参数。
 
+#### 7.1.1 `mutate` 的职责边界
+
+`mutate(func)` 的准确定位是：把用户写的 Python DSL 函数变成一个 **以 Builder 为解释器的 IR 生成器**。
+
+它不直接生成最终 TIR，也不直接返回 `PrimFunc`。它只负责完成前端改写：
+
+```text
+原始 Python DSL 函数
+    -> 取源码 AST
+    -> DSLMutator 改写成 __tb.xxx(...) 调用
+    -> 编译改写后的 AST
+    -> 返回 IRGenerator
+    -> 后续交给 Builder 执行，真正构造 TileLang/TIR IR
+```
+
+这里的 `__tb` 是改写后函数的隐式 Builder 参数。也就是说，用户原本写的是：
+
+```python
+def kernel(A, B):
+    for i in range(128):
+        B[i] = A[i] + 1
+```
+
+`mutate` 的目标不是执行这个 Python 函数，而是生成一个新的 Python 函数。这个新函数执行时，每个 DSL 动作都会走 `__tb.ctx_for`、`__tb.bind`、`__tb.assign_slice`、`__tb.rval` 等 hook。
+
+所以职责边界可以这样划分：
+
+| 组件 | 职责 |
+| --- | --- |
+| `mutate` / `DSLMutator` | 把 Python 语法改写成 Builder API 调用 |
+| `IRGenerator` | 保存改写后的可执行函数、改写源码、额外类型提示 |
+| `Builder` | 执行改写后的函数，把 `__tb.xxx(...)` 落成 TIR/TIRX 构造 |
+| `IRBuilder` | 更底层的 TVM/TIRX IR 构造器 |
+
+因此 `IRGenerator` 不是 IR，也不是 Builder；它是“已经被 AST 改写过、未来可以驱动 Builder 生成 IR 的 Python 函数包装器”。
+
+#### 7.1.2 `mutate` 的核心处理流程
+
+`mutate(func)` 的关键代码路径是：
+
+```python
+tree = utils.get_ast(func)
+filename = inspect.getsourcefile(func) or inspect.getfile(func)
+nonlocals = utils.get_func_nonlocals(func)
+
+mut = DSLMutator(nonlocals, func.__globals__, Path(filename).name)
+tree = mut.visit(tree)
+
+make_closure = utils.get_compiled_object(
+    tree,
+    "make_closure",
+    filename,
+    func.__globals__,
+)
+fn = make_closure(**nonlocals)
+return IRGenerator(gen=fn, source=ast.unparse(tree), extra_type_hints=mut.extra_type_hints)
+```
+
+逐步看：
+
+1. `utils.get_ast(func)` 拿到用户函数源码对应的 Python AST。
+2. `inspect.getsourcefile/getfile` 记录源码文件，后续用于 span/fileline 诊断。
+3. `utils.get_func_nonlocals(func)` 收集闭包变量。
+4. `DSLMutator(...).visit(tree)` 遍历并改写整棵 AST。
+5. `utils.get_compiled_object(...)` 把改写后的 AST 编译成 Python 对象，并取出 `make_closure`。
+6. `make_closure(**nonlocals)` 把闭包变量重新注入，得到最终的 `fn`。
+7. 返回 `IRGenerator(gen=fn, source=..., extra_type_hints=...)`。
+
+闭包变量单独处理是这里一个很重要的细节。代码中特别避免把 closure 变量直接塞进一个复制出来的 globals dict，因为复制 globals 会持有原 global namespace 的引用，可能导致原始 global namespace 无法释放。当前设计让：
+
+```text
+globals 继续使用 func.__globals__
+nonlocals 通过 make_closure 的参数传入
+```
+
+这样既保留原函数的名字解析环境，又避免额外复制 globals 带来的引用生命周期问题。
+
+#### 7.1.3 `make_closure` 和 `IRGenerator.gen` 到底长什么样
+
+`DSLMutator.visit_FunctionDef` 会把原函数包装成类似这样的结构：
+
+```python
+def make_closure(captured_1, captured_2, ...):
+    def kernel(__tb):
+        __tb_fl = "xxx.py"
+        __tb_fn = "kernel"
+        range = __tb.override("range")
+
+        def kernel(A, B, **__kwargs):
+            A = __tb.arg("A", A)
+            B = __tb.arg("B", B)
+            ...
+            # 原函数体，但已经被改写成 __tb.xxx(...) 调用
+
+        return kernel
+
+    return kernel
+```
+
+因此 `IRGenerator.gen` 的类型是：
+
+```python
+Callable[[BaseBuilder], Callable[_P, _T]]
+```
+
+实际调用形态是：
+
+```python
+ir_gen.gen(builder)(**annot)
+```
+
+第一层 `gen(builder)` 把 Builder 塞进去，返回改写后的用户函数；第二层 `(**annot)` 执行这个用户函数。执行过程中，它不再只是普通 Python 计算，而是持续调用 `builder.arg`、`builder.bind`、`builder.ctx_for`、`builder.ctx_if`、`builder.ctx_with`、`builder.eval`、`builder.ret` 等方法。
+
+例如 `@T.prim_func` 非 eager-jit 分支会这样使用：
+
+```python
+builder = Builder()
+with builder.prim_func(func.__name__):
+    ir_gen.gen(builder)(**annot)
+prim_func = builder.get()
+```
+
+也就是：`mutate` 产出的不是 `PrimFunc`，而是“如何构造 `PrimFunc` 的可执行 recipe”。真正的 `PrimFunc` 要等 Builder 执行这份 recipe 后才产生。
+
+#### 7.1.4 `IRGenerator` 三个字段的含义
+
+`IRGenerator` 当前有三个字段：
+
+```python
+@dataclass
+class IRGenerator(Generic[_P, _T]):
+    gen: Callable[[BaseBuilder], Callable[_P, _T]]
+    source: str
+    extra_type_hints: dict[str, Any] = field(default_factory=dict)
+```
+
+`gen` 是最核心的产物。它保存了改写后的可执行函数入口，后续给它一个 `Builder`，它就能返回一个“执行时驱动 Builder”的函数。
+
+`source` 是 `ast.unparse(tree)` 得到的改写后源码。它不是用户原始源码，而是已经变成 `__tb.xxx(...)` 调用后的源码。构建失败时，`builder.py::prim_func` 会把 `ir_gen.source` 写进 fatal log，方便直接看真正被执行的改写版本。
+
+`extra_type_hints` 是 mutator 从函数体 annotation 中额外收集出的类型信息。eager style 里常见这种写法：
+
+```python
+def kernel(A, B):
+    A: T.Tensor((M, N), T.float16)
+    B: T.Tensor((M, N), T.float16)
+```
+
+这些类型信息不一定写在 Python 函数签名上，所以 `DSLMutator._parse_arg_annot` 会尝试从函数体里的 `AnnAssign` 中识别 `T.Tensor`、`T.StridedTensor`、`T.ptr`、`T.float32` 等信息，并保存到 `extra_type_hints`。后续 `builder.py::prim_func` 会优先读取：
+
+```python
+if param.name in ir_gen.extra_type_hints:
+    annot[param.name] = ir_gen.extra_type_hints[param.name]
+```
+
+这使 eager JIT 能识别哪些参数是 tensor/buffer 参数，进而做 phase1/phase2 的 shape、stride、constexpr 推导。
+
 ### 7.2 `if` 改写
 
 用户写：
@@ -879,6 +1036,441 @@ if __tb.skip_kernel_ctx():
 | 语句 span | `__tb.set_fileline(...)` | 给 Builder 记录原始文件/行号，macro 展开时用于更可读的诊断 |
 
 这说明 eager AST 改写不是只覆盖 “TileLang API 调用”，而是尽量把常见 Python 控制流和赋值语义映射到可构造 TIR 的 Builder hook。
+
+### 7.8 `DSLMutator` 的执行原理和 Python AST API 速查
+
+`DSLMutator` 是 `eager/ast.py` 里真正执行 AST 改写的类：
+
+```python
+class DSLMutator(ast.NodeTransformer):
+    ...
+```
+
+它继承自 Python 标准库 `ast.NodeTransformer`。这个 API 的工作方式是：调用 `mut.visit(tree)` 后，它会递归遍历整棵 AST；遍历到某类节点时，如果类里定义了对应的 `visit_XXX` 方法，就调用它。
+
+例如：
+
+| AST 节点 | 对应方法 | Python 源码例子 |
+| --- | --- | --- |
+| `ast.If` | `visit_If` | `if cond: ...` |
+| `ast.For` | `visit_For` | `for i in xs: ...` |
+| `ast.Assign` | `visit_Assign` | `x = y` |
+| `ast.AugAssign` | `visit_AugAssign` | `x += y` |
+| `ast.AnnAssign` | `visit_AnnAssign` | `x: T.float32 = y` 或 `A: T.Tensor(...)` |
+| `ast.BoolOp` | `visit_BoolOp` | `a and b` / `a or b` |
+| `ast.Compare` | `visit_Compare` | `a < b < c` |
+| `ast.Name` | `visit_Name` | 变量读取或写入 |
+| `ast.FunctionDef` | `visit_FunctionDef` | `def kernel(...): ...` |
+
+`NodeTransformer` 的 `visit_XXX` 可以返回不同形态：
+
+| 返回值 | 含义 |
+| --- | --- |
+| 原节点或新节点 | 用这个节点替换原节点 |
+| `list[ast.AST]` | 在语句位置用多条语句替换原来一条语句 |
+| `None` | 删除这个节点 |
+
+TileLang 大量使用第二种能力。例如一个 `Assign` 可能被改成多条 `__tb.bind(...)` / `__tb.assign_slice(...)` 语句，tuple unpack 也需要多阶段展开。
+
+#### 7.8.1 为什么很多方法先调用 `generic_visit`
+
+`DSLMutator` 里经常出现：
+
+```python
+node = self.generic_visit(node)
+```
+
+这表示先递归改写当前节点的子节点，再处理当前节点本身。也就是说，执行顺序接近“自底向上”：
+
+```text
+先改表达式里的变量读取、布尔表达式、子语句
+再把外层 if/for/assign/with 等语句整体改写成 Builder hook
+```
+
+例如：
+
+```python
+if a and b:
+    x = y
+```
+
+会先把 `a`、`b`、`y` 这些 load 位置的变量改成 `__tb.rval(...)`，再把 `a and b` 改成 `__tb.boolop(...)`，再把 `x = y` 改成 `x = __tb.bind(...)`，最后把整个 `if` 改成 `__tb.ctx_if/ctx_then/ctx_else` 形式。
+
+#### 7.8.2 `quote` / `quote1` / `quote_expr`：用模板字符串造 AST
+
+TileLang 没有到处手写 `ast.Call(...)`、`ast.Attribute(...)`、`ast.For(...)`，而是封装了一组三个 helper：
+
+```python
+def quote(expr: str, *, passes: list[Any] | None = None, span=None, **kws) -> list[ast.AST]
+def quote1(expr: str, *, passes: list[Any] | None = None, span=None, **kws) -> ast.AST
+def quote_expr(expr: str, **kws) -> ast.expr
+```
+
+它们的核心思路是：
+
+1. 用 `ast.parse(expr)` 把一小段 Python 模板源码转成 AST。
+2. 用 `QuoteVisitor` 把模板里的占位符替换成真实 AST 节点。
+3. 需要插入语句块时，用模板里的 `pass` 作为占位符，再用 `passes` 替换。
+
+例如 `visit_Expr`：
+
+```python
+return quote("__tb.eval(value)", value=node.value, span=node)
+```
+
+模板里的 `value` 是一个 `ast.Name` 占位符。`QuoteVisitor.visit_Name` 看到它在 `self.names` 里，就替换成真实的 `node.value`。所以：
+
+```python
+T.copy(A, B)
+```
+
+会被改写成：
+
+```python
+__tb.eval(T.copy(A, B))
+```
+
+再看 `visit_If` 的模板：
+
+```python
+for br in __tb.ctx_if(cond):
+  for _ in __tb.ctx_then(br):
+    pass
+```
+
+这里的 `pass` 不是为了保留空语句，而是“把原 if body 插进来”的占位符。`QuoteVisitor.visit_Pass` 会从 `passes` 里弹出对应语句列表，替换这个 `pass`。
+
+这套模板机制让 AST 改写代码保持可读：大结构用 Python 代码字符串表达，细节节点用 AST 对象替换，避免全部手写 AST 构造器。
+
+#### 7.8.3 `ast.parse`、`ast.unparse` 和 AST 节点上下文
+
+Python 标准库 `ast` 的几个 API 在这里很核心。
+
+`ast.parse(src)` 把源码字符串解析成 AST：
+
+```python
+import ast
+
+tree = ast.parse("x = y + 1")
+print(ast.dump(tree, indent=2))
+```
+
+它会得到一个 `ast.Module`，里面包含 `ast.Assign`、`ast.Name`、`ast.BinOp`、`ast.Constant` 等节点。
+
+`ast.unparse(tree)` 做相反的事：把 AST 尽量还原成 Python 源码字符串。`mutate` 最后保存的 `IRGenerator.source` 就来自：
+
+```python
+source = ast.unparse(tree)
+```
+
+注意这里的 `source` 是改写后源码，不是原始源码。
+
+`ast.Name` 有一个很重要的字段：`ctx`。它表示这个变量名是在“读取”还是“写入”：
+
+```python
+y = x   # x 是 ast.Load，y 是 ast.Store
+x = y   # x 是 ast.Store，y 是 ast.Load
+```
+
+对应 AST 节点类似：
+
+```python
+ast.Name(id="x", ctx=ast.Load())
+ast.Name(id="x", ctx=ast.Store())
+```
+
+`DSLMutator.visit_Name` 只改写 `Load`：
+
+```python
+if isinstance(node.ctx, ast.Load):
+    return quote_expr(f"__tb.rval('{node.id}', node)", node=node, span=node)
+return node
+```
+
+这是必要的。赋值左边的变量必须保持可写目标；只有读取变量时，才能改成 `__tb.rval("name", value)`，让 Builder 观察变量读取。
+
+#### 7.8.4 span/fileline：为什么要保留 `lineno` 和 `col_offset`
+
+Python AST 节点通常带源码位置信息：
+
+```text
+lineno
+col_offset
+end_lineno
+end_col_offset
+```
+
+`ast_get_span` / `ast_set_span` 会在模板替换时尽量把原节点的 span 复制到新节点上。原因是：改写后的 AST 已经和用户源码长得不一样了，如果不保留原始位置，报错和 IR span 会很难读。
+
+此外，`SpanAttacher` 会在每条带行号的 statement 前插入：
+
+```python
+__tb.set_fileline(__tb_fl, lineno, __tb_fn)
+```
+
+这样 Builder 在构造 IR 或展开 macro 时，能记录当前语句来自哪个文件、哪一行、哪个函数。后续诊断信息就不会只指向改写后的临时代码。
+
+#### 7.8.5 控制流改写：把 Python 控制流变成 Builder frame
+
+`visit_If` 把：
+
+```python
+if cond:
+    body
+else:
+    other
+```
+
+改成近似：
+
+```python
+for br in __tb.ctx_if(cond):
+    for _ in __tb.ctx_then(br):
+        body
+    for _ in __tb.ctx_else(br):
+        other
+```
+
+这个形态看起来绕，但它让 Builder 能接管控制流。`BaseBuilder` 的默认实现会按普通 Python bool 语义运行；真正的 `Builder` 则可以在 `cond` 是 `PrimExpr` 时打开 TIR `If` frame。
+
+`visit_For` 把：
+
+```python
+for i in iter:
+    body
+```
+
+改成近似：
+
+```python
+for __0 in __tb.ctx_for(iter):
+    i = __tb.bind("i", __0)
+    body
+```
+
+这里 `__0` 由 `get_tmp()` 生成，避免和用户变量撞名。`ctx_for` 接管循环对象，`bind("i", __0)` 把用户源码中的循环变量名和 Builder 产生的 loop var 关联起来。
+
+`visit_While` 则把：
+
+```python
+while cond:
+    body
+```
+
+改成：
+
+```python
+for _ in __tb.ctx_while(lambda: cond):
+    body
+```
+
+这里 `lambda: cond` 和 boolop 类似，是为了延迟条件求值，让 Builder 决定每次循环如何处理条件。
+
+#### 7.8.6 赋值改写：`bind`、`assign_slice` 和 tuple unpack
+
+赋值的核心入口是 `visit_Assign` 和 `_emit_assign_target`。
+
+普通变量赋值：
+
+```python
+x = value
+```
+
+会变成：
+
+```python
+x = __tb.bind("x", value)
+```
+
+下标赋值：
+
+```python
+A[i] = value
+```
+
+会变成：
+
+```python
+__tb.assign_slice(A, i, value)
+```
+
+这两个 hook 分别让 Builder 处理 local binding 和 buffer/slice store。
+
+tuple unpack 会更复杂。例如：
+
+```python
+a, b = b, a
+```
+
+不能简单按顺序改成：
+
+```python
+a = b
+b = a
+```
+
+否则会破坏 Python swap 语义。因此 `_emit_assign_target` 会做两阶段绑定：
+
+```text
+第一阶段：先把右值解包到临时变量，并用 __tb.bind("_", tmp) 处理匿名临时值
+第二阶段：再把临时变量绑定到真正目标，或对 subscript 目标调用 assign_slice
+```
+
+这就是 `_emit_assign_target` 里 `unpacked`、`bind_lvals`、`bind_rvals`、`flush_binds()` 的用途。
+
+增强赋值由 `visit_AugAssign` 处理：
+
+```python
+x += y      -> x = __tb.aug_assign("Add", x, y, name="x")
+A[i] += y   -> __tb.aug_assign_slice("Add", A, i, y)
+```
+
+操作符名来自：
+
+```python
+operator.__class__.__name__
+```
+
+例如 `ast.Add()` 对应字符串 `"Add"`，`ast.Sub()` 对应 `"Sub"`。这样 Builder 只需要接收统一的操作符名即可。
+
+#### 7.8.7 布尔表达式、链式比较和短路语义
+
+`visit_BoolOp` 处理 `and/or`。它不会把：
+
+```python
+a and b
+```
+
+简单改成：
+
+```python
+__tb.boolop("And", a, b)
+```
+
+因为那样 `b` 会提前求值，破坏 Python 的短路语义。当前实现会生成：
+
+```python
+__tb.boolop("And", a, lambda: b)
+```
+
+对于多个值：
+
+```python
+a and b and c
+```
+
+会从右向左构造嵌套表达式：
+
+```python
+__tb.boolop("And", a, lambda: __tb.boolop("And", b, lambda: c))
+```
+
+`visit_UnaryOp` 只特殊处理 `not`：
+
+```python
+not a -> __tb.boolop("Not", a)
+```
+
+`visit_Compare` 处理链式比较。Python 里的：
+
+```python
+a < b < c
+```
+
+语义是：
+
+```python
+(a < b) and (b < c)
+```
+
+而不是 `(a < b) < c`。所以 `visit_Compare` 会先拆成多个二元比较，再用 `__tb.boolop("And", ...)` 连接，尽量保留 Python 原语义。
+
+#### 7.8.8 `visit_FunctionDef`：把用户函数变成 Builder 入口
+
+`visit_FunctionDef` 是最关键的包装步骤。它会：
+
+1. 给每个参数插入 `arg = __tb.arg("arg", arg)`。
+2. 清除参数 annotation，避免改写后的函数签名继续持有 DSL 类型对象。
+3. 扫描函数体内的参数 annotation，收集 `extra_type_hints`。
+4. 清空 decorator list，避免编译改写后 AST 时重复应用原装饰器。
+5. 给函数加 `**__kwargs`，方便后续以 keyword 形式传入推导出的参数。
+6. 用 `SpanAttacher` 给语句插入 `__tb.set_fileline(...)`。
+7. 把整个函数包进 `make_closure(...)`。
+
+最终结果可以近似理解为：
+
+```text
+make_closure(nonlocals...)
+    -> outer(__tb)
+        -> inner_user_func(*args, **kwargs)
+            -> 执行改写后的 DSL 语句
+```
+
+所以 `IRGenerator.gen(builder)` 返回的其实是 `inner_user_func`。调用它时，函数体中的 Python 语句已经变成一串 Builder hook。
+
+#### 7.8.9 `_try_eval`、`eval` 和 annotation 收集
+
+`DSLMutator._parse_arg_annot` 会尝试识别函数体内这种 annotation：
+
+```python
+A: T.Tensor((M, N), T.float16)
+b: T.float32
+```
+
+它不是用字符串匹配，而是先看 AST 结构：
+
+```text
+T.float32               -> ast.Attribute
+T.Tensor(...)           -> ast.Call(func=ast.Attribute(...))
+T.Tensor[...]           -> ast.Subscript(value=ast.Attribute(...))
+```
+
+如果结构像目标类型，就调用 `_try_eval`：
+
+```python
+code = "lambda " + ",".join(nonlocals.keys()) + ": " + ast.unparse(node)
+return eval(code, globals)(**nonlocals)
+```
+
+也就是说，它把 annotation 节点重新 unparse 成表达式，放进一个 lambda 里，在原函数 globals 和捕获的 nonlocals 环境中尝试求值。
+
+如果求值结果是 `dtypes.dtype`，就记录具体 dtype；如果求值结果是 `TensorProxy` / `StridedTensorProxy` 或 `ptr`，就记录为 `ptr`。这些信息最终进入 `IRGenerator.extra_type_hints`。
+
+这里的 `eval` 只用于尝试解释 annotation 表达式，不是执行用户函数体。失败会被捕获并返回 `_empty`，所以不认识的 annotation 不会直接中断 AST 改写。
+
+#### 7.8.10 一个最短心智模型
+
+`DSLMutator` 可以看成 TileLang eager DSL 的语法前端：
+
+```text
+Python AST
+    ast.If          -> __tb.ctx_if / ctx_then / ctx_else
+    ast.For         -> __tb.ctx_for + __tb.bind
+    ast.Assign      -> __tb.bind / __tb.assign_slice
+    ast.AugAssign   -> __tb.aug_assign / __tb.aug_assign_slice
+    ast.Name(Load)  -> __tb.rval
+    ast.Return      -> __tb.ret
+    ast.With        -> __tb.ctx_with
+    ast.BoolOp      -> __tb.boolop
+    ast.IfExp       -> __tb.ifexp
+    ast.Assert      -> __tb.assert_expr
+    ast.FunctionDef -> make_closure + Builder entry
+```
+
+它用到的 Python 语言库能力主要是：
+
+| Python API | 用途 |
+| --- | --- |
+| `ast.NodeTransformer` | 递归遍历并替换 AST 节点 |
+| `generic_visit` | 先递归改写子节点，再处理当前节点 |
+| `ast.parse` | 把模板 Python 代码转成 AST |
+| `ast.unparse` | 把 AST 还原成源码字符串，用于 debug 和 `_try_eval` |
+| `ast.Name(..., ctx=...)` | 区分变量读取 `Load` 和写入 `Store` |
+| `lineno/col_offset` | 保留源码位置，改善诊断和 IR span |
+| `eval` | 在 globals/nonlocals 环境中尝试求值 annotation |
+| `inspect.getsourcefile/getfile` | 获取原函数文件名，用于 fileline 信息 |
+
+最关键的一点仍然是：`DSLMutator` 不生成最终 TIR。它只是把用户函数改造成“执行时会不断调用 Builder 的 Python 函数”。真正把这些调用变成 IR 的，是后面的 `Builder`。
 
 ---
 

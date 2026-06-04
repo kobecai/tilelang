@@ -1142,6 +1142,72 @@ for br in __tb.ctx_if(cond):
 
 这套模板机制让 AST 改写代码保持可读：大结构用 Python 代码字符串表达，细节节点用 AST 对象替换，避免全部手写 AST 构造器。
 
+补充理解：`QuoteVisitor` 和 `DSLMutator` 不是重复设计，而是两层不同粒度的
+AST transformer。
+
+```text
+DSLMutator
+    处理用户函数源码 AST
+    决定普通 Python 语法应该改写成什么 Builder 调用结构
+
+quote(...)
+    把一小段 Python 模板字符串解析成模板 AST
+
+QuoteVisitor
+    处理模板 AST
+    把模板里的名字占位符和 pass 占位符替换成真实 AST 片段
+```
+
+也就是说，`DSLMutator` 是主改写器，输入是用户写的 DSL 函数；`QuoteVisitor`
+是模板替换器，输入是 `quote(...)` 临时 parse 出来的模板 AST。二者处理的 AST
+来源不同，职责也不同。
+
+为什么需要模板？因为手写 AST 构造器非常啰嗦。比如想生成：
+
+```python
+__tb.eval(value)
+```
+
+如果不用 `quote`，就要手动创建 `ast.Expr`、`ast.Call`、`ast.Attribute`、
+`ast.Name` 等一串节点。用模板以后，`DSLMutator` 可以直接表达改写规则：
+
+```python
+return quote("__tb.eval(value)", value=node.value, span=node)
+```
+
+这里的模板必须是合法 Python。`value` 在模板里先只是普通变量名，经过
+`ast.parse(...)` 后变成 `ast.Name(id="value")`。随后 `QuoteVisitor.visit_Name`
+发现 `value` 在 `kws` 里，就把这个 `Name` 节点替换成真实的 `node.value`。
+
+`passes` 则专门用来替换模板里的语句块占位符。比如 `visit_If` 里模板大致是：
+
+```python
+for br in __tb.ctx_if(cond):
+    for _ in __tb.ctx_then(br):
+        pass
+```
+
+这里的 `pass` 不是最终要保留的空语句，而是“这里插入原始 if body”的插槽。
+调用方传入：
+
+```python
+passes=[node.body]
+```
+
+`QuoteVisitor.visit_Pass` 遇到第一个 `pass` 时，会执行：
+
+```python
+item = self.passes.pop(0)
+return item if item else node
+```
+
+于是模板里的 `pass` 被替换成原始 `if` body 的 AST 语句列表。带 `else` 的情况会有
+两个 `pass`，对应 `passes=[node.body, node.orelse]`，按出现顺序依次替换。
+
+所以模板机制在 TileLang 里的作用可以概括为：用一段短小合法的 Python 代码描述
+新 AST 的外壳，再把用户原始 AST 的局部片段塞进外壳的占位位置，最后得到完整的
+Builder 调用结构。
+
 #### 7.8.3 `ast.parse`、`ast.unparse` 和 AST 节点上下文
 
 Python 标准库 `ast` 的几个 API 在这里很核心。

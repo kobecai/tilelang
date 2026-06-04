@@ -247,6 +247,113 @@ print(foo(10))
 这里能看到两者的联系：`foo` 是 function object；`foo.__code__` 是它内部持有的
 函数体 code object。
 
+### `exec(code, namespace)` 到底做了什么
+
+这段代码的关键是 `namespace`：
+
+```python
+namespace = {}
+exec(code, namespace)
+
+foo = namespace["foo"]
+
+print(type(foo))
+print(type(foo.__code__))
+print(foo(10))
+```
+
+`exec(code, namespace)` 的意思是：执行 `code` 这段模块级 code object，并把执行
+过程中创建出来的名字放进 `namespace` 这个字典。
+
+假设 `code` 来自这段源码：
+
+```python
+source = """
+a = 123
+
+def foo(x):
+    return x + 1
+"""
+
+code = compile(source, "<demo>", "exec")
+```
+
+刚执行完 `compile()` 时，`code` 只是“编译好的模块级代码”。它还没有真的运行，
+所以此时不会有 `a`，也不会有 `foo`。
+
+```python
+namespace = {}
+print(namespace)
+```
+
+这时 `namespace` 还是空的：
+
+```python
+{}
+```
+
+执行：
+
+```python
+exec(code, namespace)
+```
+
+Python 会在 `namespace` 这个命名空间里运行 `code`。运行过程大致相当于：
+
+```python
+# 在 namespace 里执行
+a = 123
+
+def foo(x):
+    return x + 1
+```
+
+执行完以后，`namespace` 里就多了这些用户定义的名字：
+
+```python
+namespace["a"]    # 123
+namespace["foo"]  # <function foo ...>
+```
+
+所以后面才能写：
+
+```python
+foo = namespace["foo"]
+```
+
+这一步不是在“重新定义函数”，而是从字典里把刚刚由 `exec()` 创建并绑定进去的
+函数对象取出来。
+
+完整观察代码可以写成：
+
+```python
+namespace = {}
+print("exec 前:", sorted(k for k in namespace if not k.startswith("__")))
+
+exec(code, namespace)
+
+print("exec 后 a:", namespace["a"])
+print("exec 后 foo:", namespace["foo"])
+print("foo 的类型:", type(namespace["foo"]))
+print("foo.__code__ 的类型:", type(namespace["foo"].__code__))
+print("foo(10):", namespace["foo"](10))
+```
+
+你会看到：
+
+```text
+exec 前: []
+exec 后 a: 123
+exec 后 foo: <function foo ...>
+foo 的类型: <class 'function'>
+foo.__code__ 的类型: <class 'code'>
+foo(10): 11
+```
+
+一句话总结：`compile()` 负责生成 code object；`exec(code, namespace)` 负责
+真正执行这个 code object，并把执行期间定义出来的变量、函数、类等名字放进
+`namespace`。
+
 ### 为什么 `def` 很关键
 
 `def` 在 Python 里不是纯声明，而是一条会被执行的语句。概念上，这段代码：

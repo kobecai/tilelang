@@ -3391,6 +3391,14 @@ tilelang.jit
     -> 包成 JITImpl
 ```
 
+这里的 `eager_jit=True` 名字确实很容易误导。它在这里不是“这个函数一定走 eager mode”，更像是：
+
+```text
+给 @tilelang.jit 用的 prim_func 包装模式
+```
+
+也就是：复用 `prim_func` 这套 AST mutate / annotation 收集 / IRGenerator 基础设施，但不要像 `@T.prim_func` 那样立刻生成 `PrimFunc`，而是先返回一个 `JITFunc`，交给外层 `JITImpl` 在真实调用时再决定 lazy/eager，生成 TIR、compile、cache、执行或返回 kernel。
+
 对应的重点源码位置：
 
 | 阶段 | 入口 |

@@ -41,6 +41,8 @@ python script
 JITImpl.__call__(*args, **kwargs)
   -> infer lazy/eager mode
   -> JITFunc.parse_args(...)
+     -> may check/build JITFunc.p1_cache
+        -> value is TirTemplate, not runnable kernel
   -> check JITImpl._kernel_cache
   -> cache miss
   -> JITImpl.compile(...)
@@ -319,6 +321,10 @@ key, kernel_args = self.func.parse_args(*args, **kwargs)
 - `p1_key`: 非 tensor 编译期参数
 - `p2_key`: 从 tensor shape/stride 或显式 constexpr 推导出的动态形状 key
 
+`p2_key` 不包含 `target`、`target_host`、`execution_backend`、`pass_configs`
+或 `compile_flags`。这些编译选项对单个 `JITImpl` 来说通常是对象属性，
+对底层跨对象/跨进程 cache 来说则进入 `KernelCache` key。
+
 ### value
 
 value 是：
@@ -487,6 +493,103 @@ return JITKernel
 
 注意：编译本身不在 `_lock` 保护范围内。因此多个线程同时 miss 时，仍然可能
 重复编译同一个 kernel。
+
+## cache 访问顺序和短路能力
+
+这里要区分“模板 cache”和“可运行 kernel cache”。
+
+`JITFunc.p1_cache` 是模板 cache：
+
+```text
+key: p1_key
+value: TirTemplate
+```
+
+它的 value 不是可运行 kernel。因此命中 `p1_cache` 后，调用不会结束，仍然
+要继续计算 `p2_key`，再继续查 `JITImpl._kernel_cache`。它只能省掉
+“重新构造 TIR 模板”这一步。
+
+后面的几层是 kernel cache 或 kernel artifact cache：
+
+```text
+JITImpl._kernel_cache
+  value: JITKernel
+  hit 后可以直接执行或返回，不再访问 KernelCache._memory_cache / disk cache / tilelang.lower
+
+KernelCache._memory_cache
+  value: JITKernel
+  hit 后可以返回 JITKernel，不再访问 disk cache / tilelang.lower
+
+Disk kernel cache
+  value: 可重建 JITKernel 的 artifact
+  hit 后会 from_database 重建 JITKernel，不再调用 tilelang.lower/codegen
+```
+
+所以不能简单说“三层 cache 每次都要访问”。更准确的顺序是：
+
+```text
+JITImpl.__call__
+  -> JITFunc.parse_args(...)
+     -> 可能访问 JITFunc.p1_cache
+        hit:
+          复用 TirTemplate
+          继续往下
+        miss:
+          构造 TirTemplate
+          写入 p1_cache
+          继续往下
+
+  -> 查 JITImpl._kernel_cache
+     hit:
+       直接得到可运行 JITKernel
+       停止访问更底层 cache
+
+     miss:
+       JITImpl.compile(...)
+         -> JITFunc.get_tir(...)
+         -> tilelang.cache.cached(...)
+            -> 查 KernelCache._memory_cache
+               hit:
+                 返回 JITKernel
+                 不访问 disk cache
+
+               miss:
+                 查 disk cache
+                   hit:
+                     from_database 重建 JITKernel
+                     写入 KernelCache._memory_cache
+                     返回
+
+                   miss:
+                     JITKernel(...)
+                       -> tilelang.lower(...)
+                       -> codegen / adapter
+                     写 disk cache
+                     写 KernelCache._memory_cache
+                     返回
+
+       写入 JITImpl._kernel_cache
+       执行或返回 JITKernel
+```
+
+因此：
+
+```text
+p1_cache 命中:
+  只跳过模板构造，还要继续访问后续 kernel cache。
+
+JITImpl._kernel_cache 命中:
+  已经拿到可运行 JITKernel，直接短路后续编译链路。
+
+KernelCache._memory_cache 命中:
+  跳过磁盘读取和 lower/codegen。
+
+disk cache 命中:
+  跳过 tilelang.lower 和 backend codegen，但仍需要从 artifact 重建 JITKernel。
+```
+
+换句话说，只有“产物已经是 JITKernel”的 cache 命中，才能直接短路到执行；
+`JITFunc.p1_cache` 命中只减少前端模板构造成本。
 
 ## 磁盘 kernel cache
 
@@ -1261,22 +1364,27 @@ KernelCache key:
 JITFunc.p1_cache
   key: p1_key = tuple(sorted(non_tensor_kwargs.items()))
   value: TirTemplate
+  hit: 只跳过模板构造，不能直接执行，还要继续查 kernel cache
 
 JITImpl._kernel_cache
   key: (p1_key, p2_key)
   value: JITKernel
+  hit: 可直接执行或返回，不再访问底层 KernelCache
 
 KernelCache._memory_cache
   key: sha256(PrimFunc.script(show_meta=True), target, backend, configs, version, lib stamp, ...)
   value: JITKernel
+  hit: 不再访问 disk cache，也不调用 tilelang.lower
 
 Disk kernel cache
   key: same kernel_key as KernelCache._memory_cache
   value: source files + executable/cubin/shared library + params.pkl + optional PrimFunc/resource metadata
+  hit: from_database 重建 JITKernel，不调用 tilelang.lower/codegen
 
 Frontend cache
   key: sha256(function source/signature/name + JIT key + compile options)
   value: {"kernel_key": "..."}
+  hit: 找到 kernel_key 后仍要加载对应 disk artifact
 ```
 
 线程上，前端 builder 状态是 thread-local；这些 cache 不是 thread-local。

@@ -90,6 +90,201 @@ mod = tvm.IRModule({func.attrs["global_symbol"]: func})
 
 也就是说，lower 内部统一处理 `IRModule`，单个 `PrimFunc` 只是会被包装成一个单函数 module。
 
+### 2.1.1 问答：lower 输入的 `PrimFunc` 里有没有 TileLang 自定义/封装的 TVM 元素
+
+问题可以拆成两层：
+
+```text
+1. lower 入口收到的对象类型是不是 PrimFunc？
+2. 这个 PrimFunc 的 body/attrs/annotation 里是否还带 TileLang 自定义语义？
+```
+
+答案是：入口对象是 `tvm.tirx.PrimFunc`，但它不是“纯 vanilla TVM TIR”。它通常是 frontend/JIT 已经把 TileLang DSL 语义编码进去的高层 TIRX `PrimFunc`，里面会混有 TIRX 扩展节点、TileLang 注册的 `tl.*` / `tl.tileop.*` call、特殊 storage scope 和 block/loop annotations。
+
+#### 外壳类型：仍然是 `tvm.tirx.PrimFunc`
+
+`tilelang.lower(...)` 的签名是：
+
+```python
+def lower(
+    func_or_mod: tirx.PrimFunc | tvm.IRModule,
+    ...
+) -> CompiledArtifact:
+```
+
+如果传入的是 `PrimFunc`，`lower_to_host_device_ir` 会先用 `global_symbol` 把它包装成 `IRModule`：
+
+```python
+if isinstance(func_or_mod, tirx.PrimFunc):
+    func = func_or_mod
+    params = extrac_params(func) if not runtime_only else None
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+```
+
+另外，`tilelang/language/eager/builder.py` 中 `PrimFunc` 在运行时并不是 TileLang 自己的新 Python IR 类：
+
+```python
+if TYPE_CHECKING:
+    class PrimFunc(Generic[_P, _T], tvm.tirx.PrimFunc):
+        ...
+else:
+    PrimFunc = tvm.tirx.PrimFunc
+```
+
+所以从对象系统看，lower 入口拿到的是 `tvm.tirx.PrimFunc` 或 `tvm.IRModule`。
+
+#### 内容形态：是带 TileLang 语义的高层 TIRX
+
+虽然外壳是 `PrimFunc`，但这个 `PrimFunc` 通常来自 `@T.prim_func`、`@tilelang.jit`、eager builder 或 lazy-style JIT。frontend 在构造它时，已经把 Python DSL 映射成 TIRX/TIR 结构和 TileLang 扩展 call。
+
+常见内容包括：
+
+| TileLang 写法 | 进入 lower 前的 IR 表达 | 后续主要消费者 |
+| --- | --- | --- |
+| `T.Kernel(...)` | TIRX launch/thread/block frame 展开的 `thread_extent`、device block、block annotations | `AnnotateDeviceRegions`、`SplitHostDevice`、`LowerDeviceKernelLaunch` |
+| `T.gemm(...)` | `Evaluate(Call(op=tl.tileop.gemm, ...))` | `LayoutInference`、`LowerTileOp` |
+| `T.copy(...)` | `Evaluate(Call(op=tl.tileop.copy, ...))`，某些 pass 会改写成 `tl.tileop.tma_copy` | `PipelinePlanning`、warp specialization、`LowerTileOp` |
+| `T.fill(...)` | `Call(op=tl.tileop.fill, ...)` | `LowerTileOp` |
+| `T.reduce(...)` / reducer finalize | `tl.tileop.reduce` / `tl.tileop.finalize_reducer` | `LayoutReducer`、`LowerTileOp` |
+| `T.access_ptr(...)` | frontend-only `Call(op=tl.access_ptr, ...)` | `LowerAccessPtr`、部分 vectorize/legalize pass |
+| fast math / warp reduce / device assert | `tl.__exp`、`tl.__log`、`tl.warp_reduce_sum`、`tl.device_assert` 等 `tl.*` intrinsic | `LowerIntrin`、target codegen |
+| `T.alloc_shared(...)` | TIRX buffer allocation，scope 常见为 `shared.dyn` / `shared` | layout、storage rewrite、shared memory merge、launch 参数 |
+| `T.alloc_fragment(...)` | TIRX buffer allocation，scope 为 `local.fragment` | `LayoutInference`、`LowerTileOp`，之后常被 remap 成普通 `local` |
+| `T.alloc_barrier(...)` / TMA barrier | `shared.barrier` / `shared.cluster_barrier` scope 和 `barrier_init` annotation | `LowerSharedBarrier`、TMA lowering |
+| `T.annotate_layout(...)` | SBlock annotation `layout_map` | `LayoutInference`、`LowerTileOp` |
+| `T.Pipelined(...)` | loop annotation `num_stages`、`tl_pipeline_*` | `PipelinePlanning`、`InjectSoftwarePipeline` |
+| `T.Parallel(...)` | `ForKind::kParallel`，之后带 `parallel_loop_layout` 等 annotation | `LayoutInference`、`LowerTileOp` |
+
+所以可以把 lower 输入理解成：
+
+```text
+tvm.tirx.PrimFunc
+  params / buffer_map / attrs
+  body: TIRX Stmt tree
+    For / SBlock / BufferLoad / BufferStore / Call / Evaluate / AttrStmt ...
+    + TileLang op calls: tl.tileop.copy/gemm/reduce/fill/...
+    + TileLang intrinsics: tl.access_ptr / tl.__exp / tl.warp_reduce_sum / ...
+    + TileLang storage scopes: local.fragment / shared.dyn / shared.barrier / shared.tmem
+    + TileLang annotations: layout_map / barrier_init / reducer_info / cluster_dims / ...
+```
+
+#### TileLang 的 Python DSL 对象不会原样留在 PrimFunc 里
+
+这里容易混淆：`T.Kernel`、`T.gemm`、`T.alloc_shared` 这些 Python API 是“前端构造工具”，lower 入口看到的不是这些 Python 对象本身。
+
+例如：
+
+`T.Kernel(...)` 在 Python 侧返回 `KernelLaunchFrame`，底层通过 FFI 调到 `tl.KernelLaunch`。C++ 里 `KernelLaunch` 创建一组 TIR builder frame：
+
+```text
+blockIdx.x/y/z LaunchThread frame
+threadIdx.x/y/z LaunchThread frame
+device main SBlock frame
+```
+
+退出 `with T.Kernel(...)` 后，最终留在 `PrimFunc.body` 中的是 TIRX 的 thread/block/SBlock/annotation 结构，而不是 Python 的 `KernelLaunchFrame` 对象。
+
+同理：
+
+```python
+C = T.alloc_fragment((16, 16), "float32")
+S = T.alloc_shared((128, 128), "float16")
+```
+
+进入 IR 后是 TIRX buffer allocation，关键 TileLang 信息体现在 buffer scope：
+
+```text
+C.scope() == "local.fragment"
+S.scope() == "shared.dyn"
+```
+
+#### `TileOperatorNode` 是 lowering 时临时解析出来的，不是原始 PrimFunc 中的节点
+
+TileLang C++ 里有一套 `TileOperatorNode` / `TileOperator` 抽象：
+
+```cpp
+class TileOperatorNode : public Object {
+public:
+  virtual Stmt Lower(const LowerArgs& T, arith::Analyzer* analyzer) const = 0;
+  virtual LayoutMap InferLayout(const LayoutInferArgs& T, InferLevel level) const = 0;
+};
+```
+
+这套对象负责承载 `CopyNode`、`GemmNode`、`ReduceNode`、`FillNode` 等 tile op 的 C++ lowering 逻辑。但它通常不是直接存放在输入 `PrimFunc.body` 里的 IR 节点。
+
+输入 `PrimFunc.body` 里更常见的是：
+
+```text
+Evaluate(Call(op=tl.tileop.xxx, args, annotations))
+```
+
+`LowerTileOp` 运行时会做：
+
+```cpp
+Stmt VisitStmt_(const EvaluateNode* op) final {
+  auto tile_op = ParseOperator(GetRef<Stmt>(op));
+  if (!tile_op.defined()) {
+    return IRMutatorWithAnalyzer::VisitStmt_(op);
+  }
+
+  auto lowered = tile_op->Lower(LowerArgs{...}, analyzer_);
+  return IRMutatorWithAnalyzer::VisitStmt(lowered);
+}
+```
+
+而 `ParseOperator` 的逻辑是：
+
+```text
+Call(op=tl.tileop.xxx, args, annotations)
+  -> 查 Op attr map "TLOpBuilder"
+  -> 构造 Copy/Gemm/Reduce/Fill/... TileOperator object
+  -> 调用 tile_op->Lower(...)
+```
+
+也就是说，`TileOperatorNode` 是 `LowerTileOp` 消费 `tl.tileop.*` call 时临时构造出的语义对象；原始 `PrimFunc` 主要保存的是 TVM/TIRX `Call`，其中 `op` 指向 TileLang 注册的 `tl.tileop.*`。
+
+#### Lower pipeline 如何逐步吃掉这些 TileLang 语义
+
+以 CUDA pipeline 为例，前半段会先保留高层 tile-op 语义，让规划类 pass 能看懂它们：
+
+```text
+BindTarget
+AddWrapperForSingleBufStore
+LegalizeNegativeIndex
+InjectAssumes
+Simplify
+LayoutReducer
+ProducerConsumerWarpSpecialized
+LowerBlackwell2SM
+IfStmtBinding
+PipelinePlanning
+InjectSoftwarePipeline
+LayoutInference
+LowerTileOp
+LowerL2Persistent
+DecoupleTypeCast
+LegalizeVectorizedLoop
+LegalizeSafeMemoryAccess
+LowerAccessPtr
+...
+```
+
+这个顺序很重要：
+
+1. `PipelinePlanning`、warp specialization、`LayoutInference` 需要看到 `tl.tileop.copy/gemm/...` 这种高层语义，才能判断 pipeline stage、TMA/cp.async/WGMMA 路线、fragment/shared layout。
+2. `LowerTileOp` 之后，高层 tile op 会被展开成低层 TIR/intrinsic，很多 `local.fragment` buffer 也会根据 layout remap 成普通 local buffer。
+3. `LowerAccessPtr` 再把 frontend-only 的 `tl.access_ptr` 降成标准 `tvm_access_ptr` 风格节点。
+4. `LowerIntrin` 和 target codegen 最后处理残留的 `tl.*` intrinsic，例如 fast math、warp reduce、mbarrier/TMA/TCGEN 等目标相关 intrinsic。
+
+因此更精确的说法是：
+
+```text
+lower 输入是 PrimFunc；
+但这是 TileLang frontend 编码过的高层 TIRX PrimFunc；
+其中 TileLang 自定义语义主要以 tl.* / tl.tileop.* Call、scope、attrs、annotations 的形式存在；
+lower pipeline 再逐步把这些语义降成后端 codegen 能接受的低层 IR。
+```
+
 ### 2.2 输入二：`tvm.IRModule`
 
 也可以直接传入 `IRModule`。这适合多个 PrimFunc 一起 lowering，或者外部已经构造好 module 的场景。

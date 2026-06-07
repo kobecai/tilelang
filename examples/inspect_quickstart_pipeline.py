@@ -6,6 +6,7 @@ import argparse
 import importlib
 import importlib.util
 import json
+import os
 import re
 import shutil
 import sys
@@ -40,11 +41,112 @@ def _preload_stdlib_inspect() -> None:
 _preload_stdlib_inspect()
 
 
+_SOURCE_CHECKOUT_ROOTS: list[Path] = []
+_TVM_PYTHON_CANDIDATES: list[Path] = []
+_TVM_PYTHON_ROOTS: list[Path] = []
+_TVM_PYTHON_ROOTS_MISSING_TIRX: list[Path] = []
+_SOURCE_PATHS_ADDED: list[Path] = []
+_TVM_PACKAGE_PATHS_ADDED: list[Path] = []
+
+
+def _normalize_source_root(candidate: Path) -> Path | None:
+    candidate = candidate.expanduser().resolve()
+    if (candidate / "tilelang" / "__init__.py").is_file():
+        return candidate
+    if candidate.name == "tilelang" and (candidate / "__init__.py").is_file():
+        return candidate.parent
+    return None
+
+
+def _explicit_source_roots() -> list[Path]:
+    raw_roots: list[str] = []
+    env_roots = os.environ.get("TILELANG_SOURCE_ROOT")
+    if env_roots:
+        raw_roots.extend(root for root in env_roots.split(os.pathsep) if root)
+
+    index = 1
+    while index < len(sys.argv):
+        arg = sys.argv[index]
+        if arg == "--tilelang-source-root" and index + 1 < len(sys.argv):
+            raw_roots.append(sys.argv[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--tilelang-source-root="):
+            raw_roots.append(arg.split("=", 1)[1])
+        index += 1
+
+    roots = []
+    for raw_root in raw_roots:
+        root = _normalize_source_root(Path(raw_root))
+        if root is not None and root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _source_checkout_roots() -> list[Path]:
+    roots = _explicit_source_roots()
+    for candidate in Path(__file__).resolve().parents:
+        root = _normalize_source_root(candidate)
+        if root is not None and root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _prepend_existing_path(path: Path) -> bool:
+    path_str = str(path)
+    if path.is_dir() and path_str not in sys.path:
+        sys.path.insert(0, path_str)
+        return True
+    return False
+
+
+def _installed_tilelang_tvm_python_roots() -> list[Path]:
+    try:
+        spec = importlib.util.find_spec("tilelang")
+    except Exception:
+        return []
+
+    locations = getattr(spec, "submodule_search_locations", None) if spec is not None else None
+    if not locations:
+        return []
+
+    candidates = []
+    for location in locations:
+        tvm_python = Path(location) / "3rdparty" / "tvm" / "python"
+        if (tvm_python / "tvm" / "__init__.py").is_file():
+            candidates.append(tvm_python)
+    return candidates
+
+
 def _prepend_source_checkout_root() -> None:
-    for candidate in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
-        if (candidate / "tilelang" / "__init__.py").is_file() and str(candidate) not in sys.path:
-            sys.path.insert(0, str(candidate))
-            return
+    global _SOURCE_CHECKOUT_ROOTS, _TVM_PYTHON_CANDIDATES, _TVM_PYTHON_ROOTS, _TVM_PYTHON_ROOTS_MISSING_TIRX, _SOURCE_PATHS_ADDED
+
+    _SOURCE_CHECKOUT_ROOTS = _source_checkout_roots()
+    paths: list[Path] = []
+    tvm_python_roots: list[Path] = []
+    tvm_python_candidates: list[Path] = []
+    for root in _SOURCE_CHECKOUT_ROOTS:
+        paths.append(root)
+        tvm_python = root / "3rdparty" / "tvm" / "python"
+        if (tvm_python / "tvm" / "__init__.py").is_file() and tvm_python not in tvm_python_roots:
+            tvm_python_roots.append(tvm_python)
+        if (tvm_python / "tvm" / "tirx" / "__init__.py").is_file() and tvm_python not in tvm_python_candidates:
+            paths.append(tvm_python)
+            tvm_python_candidates.append(tvm_python)
+
+    for tvm_python in _installed_tilelang_tvm_python_roots():
+        if tvm_python not in tvm_python_roots:
+            tvm_python_roots.append(tvm_python)
+        if (tvm_python / "tvm" / "tirx" / "__init__.py").is_file() and tvm_python not in tvm_python_candidates:
+            paths.append(tvm_python)
+            tvm_python_candidates.append(tvm_python)
+
+    _TVM_PYTHON_ROOTS = tvm_python_roots
+    _TVM_PYTHON_CANDIDATES = tvm_python_candidates
+    _TVM_PYTHON_ROOTS_MISSING_TIRX = [path for path in tvm_python_roots if path not in tvm_python_candidates]
+    for path in reversed(paths):
+        if _prepend_existing_path(path):
+            _SOURCE_PATHS_ADDED.append(path)
 
 
 _prepend_source_checkout_root()
@@ -60,13 +162,39 @@ from tilelang.transform import PassConfigKey
 from tvm.ir import CallingConv
 from tvm.target import Target
 
+
+def _extend_imported_tvm_package_path() -> None:
+    tvm_module = sys.modules.get("tvm")
+    tvm_path = getattr(tvm_module, "__path__", None)
+    if tvm_path is None:
+        return
+
+    for tvm_python in _TVM_PYTHON_CANDIDATES:
+        tvm_package_path = tvm_python / "tvm"
+        if not (tvm_package_path / "tirx" / "__init__.py").is_file():
+            continue
+        path_str = str(tvm_package_path)
+        if path_str not in tvm_path:
+            tvm_path.append(path_str)
+            _TVM_PACKAGE_PATHS_ADDED.append(tvm_package_path)
+
+
 try:
     tirx = importlib.import_module("tvm.tirx")
-except ImportError as err:
-    tirx = None
-    _TIRX_IMPORT_ERROR = err
+except Exception as err:
+    _extend_imported_tvm_package_path()
+    try:
+        tirx = importlib.import_module("tvm.tirx")
+    except Exception as retry_err:
+        tirx = None
+        _TIRX_IMPORT_ERROR = retry_err
+        _TIRX_INITIAL_IMPORT_ERROR = err
+    else:
+        _TIRX_IMPORT_ERROR = None
+        _TIRX_INITIAL_IMPORT_ERROR = err
 else:
     _TIRX_IMPORT_ERROR = None
+    _TIRX_INITIAL_IMPORT_ERROR = None
 
 
 def _resolve_tvm_transform(name: str) -> Callable[[], Any]:
@@ -105,6 +233,45 @@ def object_summary(value: Any) -> str:
         return "None"
     ty = type(value)
     return f"{ty.__module__}.{ty.__qualname__}(id=0x{id(value):x})"
+
+
+def module_location(module_name: str) -> str | None:
+    module = sys.modules.get(module_name)
+    if module is None:
+        return None
+    module_file = getattr(module, "__file__", None)
+    if module_file:
+        return str(module_file)
+    module_path = getattr(module, "__path__", None)
+    if module_path:
+        return safe_repr(list(module_path))
+    return None
+
+
+def import_diagnostics() -> dict[str, Any]:
+    tvm_path = getattr(tvm, "__path__", None)
+    return {
+        "python_executable": sys.executable,
+        "script_path": str(Path(__file__).resolve()),
+        "source_checkout_roots": [str(path) for path in _SOURCE_CHECKOUT_ROOTS],
+        "tilelang_source_root_env": os.environ.get("TILELANG_SOURCE_ROOT"),
+        "tvm_python_roots": [str(path) for path in _TVM_PYTHON_ROOTS],
+        "tvm_python_candidates": [str(path) for path in _TVM_PYTHON_CANDIDATES],
+        "tvm_python_roots_missing_tirx": [str(path) for path in _TVM_PYTHON_ROOTS_MISSING_TIRX],
+        "source_paths_added": [str(path) for path in _SOURCE_PATHS_ADDED],
+        "tvm_package_paths_added": [str(path) for path in _TVM_PACKAGE_PATHS_ADDED],
+        "tilelang_file": module_location("tilelang"),
+        "tilelang_version": getattr(tilelang, "__version__", None),
+        "tvm_file": module_location("tvm"),
+        "tvm_package_path": [str(path) for path in tvm_path] if tvm_path is not None else None,
+        "tirx_file": module_location("tvm.tirx"),
+        "tirx_initial_import_error": repr(_TIRX_INITIAL_IMPORT_ERROR) if _TIRX_INITIAL_IMPORT_ERROR is not None else None,
+        "tirx_import_error": repr(_TIRX_IMPORT_ERROR) if _TIRX_IMPORT_ERROR is not None else None,
+    }
+
+
+def format_import_diagnostics() -> str:
+    return json.dumps(import_diagnostics(), indent=2, sort_keys=True, default=safe_repr)
 
 
 def format_mapping(title: str, mapping: Any) -> list[str]:
@@ -618,6 +785,7 @@ def manifest_config(
         "arch": args.arch,
         "target_host": str(target_host),
         "pass_configs": pass_configs,
+        "import_diagnostics": import_diagnostics(),
     }
     config.update(extra)
     return config
@@ -654,14 +822,18 @@ def dump_public_lowering(args: argparse.Namespace, dumper: ArtifactDumper, pass_
         "00_public_dumpir_fallback",
         "\n".join(
             [
-                "Manual pass-by-pass mode is unavailable because this TVM package does not provide tvm.tirx.",
-                f"Original import error: {_TIRX_IMPORT_ERROR!r}",
+                "Manual pass-by-pass mode is unavailable because tvm.tirx could not be imported from this TileLang/TVM environment.",
+                f"Initial import error: {_TIRX_INITIAL_IMPORT_ERROR!r}",
+                f"Final import error: {_TIRX_IMPORT_ERROR!r}",
                 "Falling back to tilelang.lower under TVM DumpIR instrumentation.",
                 f"TVM DumpIR directory: {dump_ir_dir}",
                 "",
+                "Import diagnostics:",
+                format_import_diagnostics(),
+                "",
             ]
         ),
-        "The installed TileLang/TVM version lacks tvm.tirx, so this run follows the public lowering path.",
+        "The active TileLang/TVM environment lacks an importable tvm.tirx, so this run follows the public lowering path.",
     )
 
     target = make_cuda_target(args.arch)
@@ -721,7 +893,13 @@ def dump_public_lowering(args: argparse.Namespace, dumper: ArtifactDumper, pass_
 
 
 def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_configs: dict[str, Any]) -> None:
-    if tirx is None:
+    tirx_module = tirx
+    if tirx_module is None:
+        if args.require_tirx:
+            raise RuntimeError(
+                "Manual pass-by-pass mode requires tvm.tirx, but it could not be imported.\n\n"
+                f"Import diagnostics:\n{format_import_diagnostics()}"
+            )
         dump_public_lowering(args, dumper, pass_configs)
         return
 
@@ -759,7 +937,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "03_bind_target",
             module,
-            lambda: tirx.transform.BindTarget(target),
+            lambda: tirx_module.transform.BindTarget(target),
             "Attaches the CUDA target to the PrimFunc so later passes can make target-specific choices.",
         )
 
@@ -928,7 +1106,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "26_lower_shared_tmem",
             module,
-            tilelang.transform.LowerSharedTmem,
+            tilelang.cuda.transform.LowerSharedTmem,
             "Lowers shared.tmem allocations and initialization placement.",
         )
         module = run_pass(
@@ -942,7 +1120,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "28_lower_shared_barrier",
             module,
-            tilelang.transform.LowerSharedBarrier,
+            tilelang.cuda.transform.LowerSharedBarrier,
             "Lowers TileLang shared barrier constructs.",
         )
 
@@ -951,7 +1129,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
                 dumper,
                 "29_fuse_mbarrier_arrive_expect_tx",
                 module,
-                tilelang.transform.FuseMBarrierArriveExpectTx,
+                tilelang.cuda.transform.FuseMBarrierArriveExpectTx,
                 "Fuses TMA mbarrier arrive/expect-tx when LowerTileOp produced TMA ops.",
             )
 
@@ -980,7 +1158,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "33_narrow_data_type_32",
             module,
-            lambda: tirx.transform.NarrowDataType(32),
+            lambda: tirx_module.transform.NarrowDataType(32),
             "Narrows index/data expressions where legal to 32-bit forms.",
         )
         module = run_pass(
@@ -1001,7 +1179,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "36_tirx_simplify_after_flatten",
             module,
-            tirx.transform.Simplify,
+            tirx_module.transform.Simplify,
             "Runs TVM/TIRX simplification on flattened index expressions.",
         )
         module = run_pass(
@@ -1043,14 +1221,14 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "42_tirx_simplify_after_unroll",
             module,
-            tirx.transform.Simplify,
+            tirx_module.transform.Simplify,
             "Cleans up after loop transformations.",
         )
         module = run_pass(
             dumper,
             "43_remove_no_op",
             module,
-            tirx.transform.RemoveNoOp,
+            tirx_module.transform.RemoveNoOp,
             "Removes no-op statements introduced by previous rewrites.",
         )
         module = run_pass(
@@ -1064,14 +1242,14 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "45_verify_memory",
             module,
-            tirx.transform.VerifyMemory,
+            tirx_module.transform.VerifyMemory,
             "Verifies memory access legality before host/device annotation.",
         )
         module = run_pass(
             dumper,
             "46_annotate_entry_func",
             module,
-            tirx.transform.AnnotateEntryFunc,
+            tirx_module.transform.AnnotateEntryFunc,
             "Marks the entry function for later host/device split and codegen.",
         )
         module = run_pass(
@@ -1092,7 +1270,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "49_lower_ldg_stg",
             module,
-            tilelang.transform.LowerLDGSTG,
+            tilelang.cuda.transform.LowerLDGSTG,
             "Lowers eligible global loads/stores to CUDA ldg/stg intrinsics.",
         )
         module = run_pass(
@@ -1144,7 +1322,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "56_inject_fence_proxy",
             module,
-            tilelang.transform.InjectFenceProxy,
+            tilelang.cuda.transform.InjectFenceProxy,
             "Injects CUDA async-proxy fences when the target and IR require them.",
         )
         module = run_pass(
@@ -1165,7 +1343,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "59_inject_tcgen05_fence",
             module,
-            tilelang.transform.InjectTcgen05Fence,
+            tilelang.cuda.transform.InjectTcgen05Fence,
             "Injects conservative Blackwell tcgen05 fences when needed.",
         )
         module = run_pass(
@@ -1181,7 +1359,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
                 dumper,
                 "61_annotate_warp_group_reg_alloc",
                 module,
-                tilelang.transform.AnnotateWarpGroupRegAlloc,
+                tilelang.cuda.transform.AnnotateWarpGroupRegAlloc,
                 "Annotates warp-group register allocation for warp-specialized kernels.",
             )
 
@@ -1216,8 +1394,8 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
 
         host_filter = get_host_call(is_device_c=is_cpu_device_backend(target))
         device_filter = get_device_call(is_device_c=is_cpu_device_backend(target))
-        host_module = tirx.transform.Filter(host_filter)(module)
-        device_module = tirx.transform.Filter(device_filter)(module)
+        host_module = tirx_module.transform.Filter(host_filter)(module)
+        device_module = tirx_module.transform.Filter(device_filter)(module)
         dumper.dump_module(
             "66_host_module_after_filter",
             host_module,
@@ -1240,7 +1418,7 @@ def dump_cuda_pipeline(args: argparse.Namespace, dumper: ArtifactDumper, pass_co
             dumper,
             "69_device_codegen_simplify",
             codegen_ir,
-            tirx.transform.Simplify,
+            tirx_module.transform.Simplify,
             "Simplifies the device-only module immediately before source generation.",
         )
         codegen_ir = run_pass(
@@ -1298,6 +1476,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-K", type=int, default=32, dest="block_K", help="quickstart_matmul only: K tile size.")
     parser.add_argument("--arch", default="sm_80", help="CUDA architecture to encode in the target, e.g. sm_80 or sm_90.")
     parser.add_argument("--target-host", default=None, help="Optional host target. Defaults to llvm if enabled, otherwise c.")
+    parser.add_argument(
+        "--tilelang-source-root",
+        default=None,
+        help="Optional TileLang source checkout root used before imports to find vendored tvm.tirx.",
+    )
     parser.add_argument("--out-dir", default="debug/issue_2307_pipeline", help="Directory for generated IR/source artifacts.")
     parser.add_argument("--clean", action="store_true", help="Remove the output directory before generating artifacts.")
     parser.add_argument("--print-ir", action="store_true", help="Also print every dumped artifact to stdout.")
@@ -1319,6 +1502,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(dump_ir_generator=True)
     parser.add_argument("--skip-codegen", action="store_true", help="Stop after host/device IR dumps and skip CUDA source generation.")
+    parser.add_argument(
+        "--require-tirx",
+        action="store_true",
+        help="Fail instead of falling back to public DumpIR when tvm.tirx is unavailable.",
+    )
     return parser.parse_args()
 
 

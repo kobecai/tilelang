@@ -201,6 +201,32 @@ def test_disk_cache_with_postproc(clean_cache_env, backend):
 
 
 @tilelang.testing.requires_cuda
+@pytest.mark.parametrize("backend", ["tvm_ffi"])
+def test_disk_cached_tvm_ffi_export_library(clean_cache_env, backend, tmp_path):
+    M = 128
+
+    @T.prim_func
+    def vector_add(A: T.Tensor((M,), T.float32), B: T.Tensor((M,), T.float32)):
+        with T.Kernel(M, threads=128) as i:
+            B[i] = A[i] + 1.0
+
+    unique_id = uuid.uuid4().hex[:8]
+    kernel_func = vector_add.with_attr("global_symbol", f"export_library_{unique_id}")
+    tilelang.compile(kernel_func, out_idx=[1], execution_backend=backend)
+
+    _dispatch_map[backend]._memory_cache.clear()
+    cached_kernel = tilelang.compile(kernel_func, out_idx=[1], execution_backend=backend)
+
+    assert cached_kernel.artifact is None
+    cached_library = Path(cached_kernel.adapter.libpath)
+    exported_library = tmp_path / "exports" / "kernel.so"
+
+    cached_kernel.export_library(str(exported_library))
+
+    assert exported_library.read_bytes() == cached_library.read_bytes()
+
+
+@tilelang.testing.requires_cuda
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_cache_miss_detection(clean_cache_env, backend):
     """Verify cache correctly misses when function changes.

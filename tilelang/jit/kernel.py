@@ -29,6 +29,7 @@ from tilelang.instrumentation import compile_pass_instrumentation, create_pass_i
 from tilelang.tools.pass_timing import create_pass_timing_tool
 import logging
 import os
+import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -750,7 +751,16 @@ class JITKernel(Generic[_P, _T]):
         # rt_module: use export_library to export
         # rt_params: use cloudpickle to serialize
 
-        if self.artifact is None or self.artifact.rt_mod is None:
+        rt_mod = getattr(self.artifact, "rt_mod", None)
+        cached_library = None
+        # Disk-cache reconstruction keeps the exported DSO, but not the
+        # compilation-exportable runtime module used to produce it.
+        if self.artifact is None and self.execution_backend == "tvm_ffi":
+            candidate = getattr(self.adapter, "libpath", None)
+            if candidate is not None and os.path.isfile(candidate):
+                cached_library = candidate
+
+        if rt_mod is None and cached_library is None:
             raise AttributeError(
                 'Runtime module is not available. Please compile the kernel with `execution_backend="tvm_ffi"` before exporting.'
             )
@@ -759,7 +769,15 @@ class JITKernel(Generic[_P, _T]):
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
 
-        self.artifact.rt_mod.export_library(kernel_file)
+        if cached_library is not None:
+            try:
+                same_file = os.path.samefile(cached_library, kernel_file)
+            except FileNotFoundError:
+                same_file = False
+            if not same_file:
+                shutil.copy2(cached_library, kernel_file)
+        else:
+            rt_mod.export_library(kernel_file)
         logger.info(f"Kernel library exported to {os.path.abspath(kernel_file)}")
 
     def _get_ptx(self, verbose: bool | None = None) -> str:

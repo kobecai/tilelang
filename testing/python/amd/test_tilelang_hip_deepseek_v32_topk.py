@@ -9,7 +9,7 @@ import tilelang.testing
 _EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "deepseek_v32"
 sys.path.insert(0, str(_EXAMPLE_DIR))
 
-from topk_selector import tl_topk  # noqa: E402
+from topk_selector import _assert_selected_values_match, get_10bit_data, tl_topk  # noqa: E402
 
 
 @tilelang.testing.requires_rocm
@@ -32,3 +32,14 @@ def test_deepseek_v32_topk_selector():
         rtol=0,
         atol=0,
     )
+
+
+@tilelang.testing.requires_rocm
+def test_deepseek_v32_topk_selector_close_values():
+    batch, seq_len, topk = 2, 8192, 256
+    values = get_10bit_data(batch, seq_len)
+    starts = torch.tensor([0, 257], dtype=torch.int32, device="cuda")
+    ends = torch.tensor([seq_len, seq_len - 137], dtype=torch.int32, device="cuda")
+
+    indices = tl_topk(values, starts, ends, topk)
+    _assert_selected_values_match(values, indices, topk, starts, ends)

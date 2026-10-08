@@ -231,6 +231,7 @@ ProxyEvent ClassifyCallProxyEvent(const CallNode *call) {
 struct ProxyEventSummary {
   bool has_async{false};
   bool has_generic{false};
+  bool has_tma_store{false};
 };
 
 ProxyEventSummary SummarizeProxyEvents(const Stmt &stmt) {
@@ -249,6 +250,10 @@ ProxyEventSummary SummarizeProxyEvents(const Stmt &stmt) {
     }
     if (const auto *eval = node.as<EvaluateNode>()) {
       const auto *call = eval->value.as<CallNode>();
+      if (call && (call->op.same_as(tma_store()) ||
+                   call->op.same_as(tma_store_scatter4()))) {
+        summary.has_tma_store = true;
+      }
       ProxyEvent event = ClassifyCallProxyEvent(call);
       if (event == ProxyEvent::kAsync) {
         summary.has_async = true;
@@ -276,6 +281,22 @@ inline void AppendFlattened(Array<Stmt> *out, const Stmt &stmt) {
 
 inline Stmt MakeFenceProxyAsyncStmt() {
   return Evaluate(Call(DataType::Handle(), fence_proxy_async(), {}));
+}
+
+bool IsTmaLeaderCondition(const PrimExpr &condition) {
+  const auto *call = condition.as<CallNode>();
+  return call && call->op.same_as(tl_shuffle_elect());
+}
+
+bool IsSharedStorageSync(const Stmt &stmt) {
+  const auto *eval = stmt.as<EvaluateNode>();
+  const auto *call = eval ? eval->value.as<CallNode>() : nullptr;
+  if (!call || !call->op.same_as(builtin::tvm_storage_sync()) ||
+      call->args.empty()) {
+    return false;
+  }
+  const auto *scope = call->args[0].as<StringImmNode>();
+  return scope && (scope->value == "shared" || scope->value == "shared.dyn");
 }
 
 /*!
@@ -366,6 +387,41 @@ private:
     for (int i = 0; i < static_cast<int>(op->seq.size()); ++i) {
       const Stmt &original = op->seq[i];
       Stmt mutated = VisitStmt(original);
+      const auto *leader = original.as<IfThenElseNode>();
+      const auto *fenced = mutated.as<SeqStmtNode>();
+      if (leader && IsTmaLeaderCondition(leader->condition) && fenced) {
+        // A writer fence hoisted out of the elected-thread branch must also
+        // precede an existing shared barrier. Do not cross any intervening
+        // generic/async memory traffic or control-flow region.
+        int sync_index = -1;
+        for (int j = static_cast<int>(seq.size()) - 1; j >= 0; --j) {
+          if (IsSharedStorageSync(seq[j])) {
+            sync_index = j;
+            break;
+          }
+          const auto *eval = seq[j].as<EvaluateNode>();
+          const auto *bind = seq[j].as<BindNode>();
+          if ((!eval && !bind) ||
+              (eval && SideEffect(eval->value) > CallEffectKind::kReadState) ||
+              (bind && SideEffect(bind->value) > CallEffectKind::kReadState)) {
+            break;
+          }
+        }
+        if (sync_index >= 0) {
+          Array<Stmt> reordered;
+          for (int j = 0; j < static_cast<int>(seq.size()); ++j) {
+            if (j == sync_index) {
+              reordered.push_back(fenced->seq[0]);
+            }
+            reordered.push_back(seq[j]);
+          }
+          seq = std::move(reordered);
+          for (int j = 1; j < static_cast<int>(fenced->seq.size()); ++j) {
+            AppendFlattened(&seq, fenced->seq[j]);
+          }
+          continue;
+        }
+      }
       AppendFlattened(&seq, mutated);
     }
     if (seq.size() == 1) {
@@ -427,6 +483,22 @@ private:
   Stmt VisitStmt_(const IfThenElseNode *op) final {
     PrimExpr cond = VisitExpr(op->condition);
     ProxyStateSet entry = current_state_;
+
+    if (entry.MayBeGeneric() && !op->else_case.defined() &&
+        IsTmaLeaderCondition(cond)) {
+      ProxyEventSummary summary = SummarizeProxyEvents(op->then_case);
+      if (summary.has_tma_store && !summary.has_generic) {
+        // All shared-memory writers must fence before synchronizing with the
+        // elected TMA-store issuer. ThreadSync subsequently inserts the barrier
+        // after this fence; SeqStmt rewriting handles barriers already present.
+        auto then_res = RewriteWithState(op->then_case, ProxyStateSet::None());
+        current_state_ = then_res.out_state.Union(ProxyStateSet::None());
+        return SeqStmt(Array<Stmt>{
+            MakeFenceProxyAsyncStmt(),
+            IfThenElse(cond, then_res.stmt),
+        });
+      }
+    }
 
     if (entry.MayBeGeneric() && op->else_case.defined()) {
       ProxyEventSummary then_summary = SummarizeProxyEvents(op->then_case);

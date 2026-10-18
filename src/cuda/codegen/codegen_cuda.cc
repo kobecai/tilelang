@@ -35,6 +35,98 @@ using namespace ffi;
 
 namespace {
 
+bool IsInt2(DataType dtype) {
+  return (dtype.is_int() || dtype.is_uint()) && dtype.bits() == 2;
+}
+
+// A byte can carry a scalar int2 value, but does not implement packed int2
+// storage or int2 arithmetic. Keep those uses unsupported when enabling casts.
+class ScalarInt2Validator : public StmtExprVisitor {
+public:
+  static void Validate(const PrimFunc &func) {
+    ScalarInt2Validator validator;
+    for (const Var &param : func->params) {
+      if (IsInt2(param.dtype())) {
+        TVM_FFI_THROW(ValueError)
+            << "CUDA int2/uint2 support is limited to scalar integer casts; "
+               "2-bit kernel parameters are not supported";
+      }
+      validator.VisitExpr(param);
+    }
+    for (const auto &entry : func->buffer_map) {
+      validator.VisitBufferUse(entry.second);
+    }
+    validator.VisitStmt(func->body);
+  }
+
+  void VisitExpr(const PrimExpr &expr) final {
+    if (IsInt2(expr.dtype()) && (!expr.dtype().is_scalar() ||
+                                 !(expr.as<CastNode>() || expr.as<VarNode>() ||
+                                   expr.as<IntImmNode>()))) {
+      TVM_FFI_THROW(ValueError)
+          << "CUDA int2/uint2 support is limited to scalar integer casts; "
+             "2-bit vector expressions and arithmetic are not supported";
+    }
+    StmtExprVisitor::VisitExpr(expr);
+  }
+
+protected:
+  void VisitBufferDef(const Buffer &buffer, bool alloc_data) final {
+    CheckBuffer(buffer);
+    StmtExprVisitor::VisitBufferDef(buffer, alloc_data);
+  }
+
+  void VisitBufferUse(const Buffer &buffer) final {
+    CheckBuffer(buffer);
+    StmtExprVisitor::VisitBufferUse(buffer);
+  }
+
+  void VisitExpr_(const VarNode *op) final {
+    if (const auto *ptr = op->type_annotation.as<PointerTypeNode>()) {
+      if (const auto *element = ptr->element_type.as<PrimTypeNode>();
+          element && IsInt2(element->dtype)) {
+        TVM_FFI_THROW(ValueError)
+            << "CUDA int2/uint2 support is limited to scalar integer casts; "
+               "packed 2-bit buffers and pointers are not supported";
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const CastNode *op) final {
+    if (IsInt2(op->dtype) || IsInt2(op->value.dtype())) {
+      if (!(op->dtype.is_int() || op->dtype.is_uint()) ||
+          !(op->value.dtype().is_int() || op->value.dtype().is_uint()) ||
+          !op->annotations.empty()) {
+        TVM_FFI_THROW(ValueError)
+            << "CUDA int2/uint2 casts require integer operands and no "
+               "rounding or saturation annotations";
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    for (const PrimExpr &arg : op->args) {
+      if (IsInt2(arg.dtype())) {
+        TVM_FFI_THROW(ValueError)
+            << "CUDA int2/uint2 support is limited to scalar integer casts; "
+               "2-bit call arguments are not supported";
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+private:
+  static void CheckBuffer(const Buffer &buffer) {
+    if (IsInt2(buffer->dtype)) {
+      TVM_FFI_THROW(ValueError)
+          << "CUDA int2/uint2 support is limited to scalar integer casts; "
+             "packed 2-bit buffers and pointers are not supported";
+    }
+  }
+};
+
 bool IsValidCPAsyncTransferBytes(int64_t bytes) {
   return bytes == 4 || bytes == 8 || bytes == 16;
 }
@@ -991,6 +1083,12 @@ void CodeGenTileLangCUDA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
         LOG(FATAL) << "Cannot convert type " << t << " to CUDA type!";
       }
     }
+    case 2: {
+      ICHECK(t.is_scalar()) << "Only scalar int2/uint2 casts are supported";
+      enable_int8_ = true;
+      os << (t.is_uint() ? "char" : "signed char");
+      return;
+    }
     case 4: {
       if (t.is_scalar()) {
         enable_int8_ = true;
@@ -1731,6 +1829,15 @@ std::string CodeGenTileLangCUDA::CastFromTo(std::string value, DataType from,
                                             DataType target) {
   if (from == target)
     return value;
+  if (IsInt2(target)) {
+    // Convert to unsigned before masking, so negative and 64-bit inputs keep
+    // their low two bits without relying on signed shifts. Use value once.
+    std::string low_bits = "((unsigned int)(" + value + ") & 3u)";
+    if (target.is_uint()) {
+      return "((unsigned char)" + low_bits + ")";
+    }
+    return "((signed char)(((int)" + low_bits + " ^ 2) - 2))";
+  }
   std::ostringstream os;
   os << "((";
   this->PrintType(target, os);
@@ -6554,6 +6661,8 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
     stream << static_cast<std::string>(code_block_source.value()) << "\n\n";
     return;
   }
+
+  ScalarInt2Validator::Validate(f);
 
   // If the function has already been forward-declared, this is a
   // no-op.

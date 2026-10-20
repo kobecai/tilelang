@@ -2176,7 +2176,17 @@ void CodeGenTileLangCuTeDSL::VisitExpr_(const BufferLoadNode *op,
         scope != "shared.cluster_barrier") {
       ref += ".load()";
     }
-    os << ref;
+    if (value_dtype.is_scalar() && value_dtype.is_uint() &&
+        !value_dtype.is_bool() && scope != "shared.barrier" &&
+        scope != "shared.cluster_barrier") {
+      // CuTeDSL reconstructs unsigned pointer elements from signless MLIR
+      // integers as signed Numeric values. Restore the TIR unsigned type before
+      // casts, comparisons, and min/max consume the scalar.
+      PrintType(value_dtype, os);
+      os << "(" << ref << ")";
+    } else {
+      os << ref;
+    }
   } else {
     ICHECK_GE(value_lanes, element_dtype.lanes())
         << "Unsupported load/store: value lanes < buffer element lanes";

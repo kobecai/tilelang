@@ -59,5 +59,51 @@ def test_cutedsl_codegen_supports_tl_ptx_cp_async():
     assert "tl.cp_async_gs(" in artifact.kernel_source
 
 
+def _sync_tma_barrier_kernel():
+    @T.prim_func
+    def main(A: T.Tensor((6, 64, 64), T.float32), B: T.Tensor((6, 32, 32), T.float32)):
+        with T.Kernel(1, threads=128):
+            shared = T.alloc_shared((32, 32), T.float32)
+            bar = T.alloc_barrier([1] * 6)
+            for i in T.serial(6):
+                T.copy(A[i, 0:32, 0:32], shared, prefer_instruction="tma", annotations={"barrier": bar[i]})
+                T.copy(shared, B[i, :, :], prefer_instruction="sync")
+
+    return main
+
+
+@tilelang.testing.requires_cuda
+def test_cutedsl_sync_tma_uses_arrival_state():
+    # Invoke source emission directly, without requiring the optional CuTeDSL
+    # Python runtime or a physical Hopper GPU.
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
+
+    with target, tvm.transform.PassContext(config={"tl.disable_warp_specialized": True}):
+        artifact = lower(_sync_tma_barrier_kernel(), target=target)
+        build = tvm.get_global_func("target.build.tilelang_cutedsl_without_compile")
+        device_mod = tilelang.transform.LowerIntrin()(artifact.device_mod)
+        device_mod = tvm.tirx.transform.Simplify()(device_mod)
+        source = build(device_mod, target).inspect_source()
+    assert "tl.mbarrier_arrive_and_wait(" in source
+    assert "tl.sync_threads()" in source
+    assert "tl.mbarrier_wait(" not in source
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
+def test_cutedsl_sync_tma_barrier_slots():
+    pytest.importorskip("cutlass.cute")
+    kernel = tilelang.compile(
+        _sync_tma_barrier_kernel(),
+        target="cutedsl",
+        execution_backend="cutedsl",
+        pass_configs={"tl.disable_warp_specialized": True},
+    )
+    A = torch.arange(6 * 64 * 64, dtype=torch.float32, device="cuda").reshape(6, 64, 64)
+    B = torch.empty((6, 32, 32), dtype=torch.float32, device="cuda")
+    kernel(A, B)
+    torch.testing.assert_close(B, A[:, :32, :32], rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

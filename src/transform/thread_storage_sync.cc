@@ -2044,14 +2044,16 @@ private:
   }
 };
 
-PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
+PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope,
+                            bool insert_syncs) {
   StorageScope sync_scope = StorageScope::Create(storage_scope);
   if (sync_scope.rank == StorageRank::kGlobal) {
     return func;
   }
   auto *n = func.CopyOnWrite();
   auto stmt = n->body;
-  if (sync_scope.rank == StorageRank::kShared && sync_scope.tag.empty()) {
+  if (insert_syncs && sync_scope.rank == StorageRank::kShared &&
+      sync_scope.tag.empty()) {
     stmt = ThreadSyncAfterWaitGroupInserter(sync_scope)(stmt);
   }
   // Get warp size from target, defaulting to 32 if not available
@@ -2062,13 +2064,18 @@ PrimFunc TileLangThreadSync(PrimFunc func, const std::string &storage_scope) {
                     .value()
                     .IntValue();
   }
-  TileLangThreadSyncPlanner planner(sync_scope, warp_size);
-  for (const auto &[_, buffer] : func->buffer_map) {
-    planner.SetBufferDataToBuffer(buffer->data, buffer);
+  if (insert_syncs) {
+    TileLangThreadSyncPlanner planner(sync_scope, warp_size);
+    for (const auto &[_, buffer] : func->buffer_map) {
+      planner.SetBufferDataToBuffer(buffer->data, buffer);
+    }
+    planner(stmt);
+    stmt = ThreadSyncInserter(sync_scope,
+                              planner.syncs_inserted_)(std::move(stmt));
   }
-  planner(stmt);
-  stmt =
-      ThreadSyncInserter(sync_scope, planner.syncs_inserted_)(std::move(stmt));
+  // Explicit syncs, including those required by synchronous tile operations,
+  // still need the right participant count when automatic insertion is
+  // disabled.
   n->body = ThreadPartialSyncRewriter::Rewrite(std::move(stmt), warp_size);
   return func;
 }
@@ -2080,15 +2087,11 @@ namespace transform {
 tvm::transform::Pass ThreadSync(const String &storage_scope) {
   auto pass_func = [storage_scope](PrimFunc f, const IRModule &m,
                                    const PassContext &ctx) {
-    auto *n = f.CopyOnWrite();
     // Check if thread storage sync is disabled
     bool disable_syncthreads =
         ctx->GetConfig(kDisableThreadStorageSync, Bool(false)).value()->value;
-    if (disable_syncthreads) {
-      return f;
-    }
-    return tl::TileLangThreadSync(std::move(f), storage_scope);
-    ;
+    return tl::TileLangThreadSync(std::move(f), storage_scope,
+                                  !disable_syncthreads);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.ThreadSync", {});
 }

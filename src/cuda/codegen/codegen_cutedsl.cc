@@ -865,6 +865,11 @@ void CodeGenTileLangCuTeDSL::VisitExpr_(const CallNode *op,
     PrintIndent();
     auto mbarrier_obj = PrintExpr_(op->args[0]);
     stream << "tl.mbarrier_arrive(" << mbarrier_obj << ")\n";
+  } else if (op->op.same_as(tl::mbarrier_arrive_and_wait())) {
+    ICHECK_EQ(op->args.size(), 1);
+    PrintIndent();
+    stream << "tl.mbarrier_arrive_and_wait(" << PrintExpr_(op->args[0])
+           << ")\n";
   } else if (op->op.same_as(tl::ptx_arrive_cluster_barrier())) {
     ICHECK_EQ(op->args.size(), 2);
     PrintIndent();

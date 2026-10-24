@@ -149,9 +149,11 @@ def copy_cluster(
         dst: Destination memory region.
         dst_block: Destination CTA rank in the cluster for SM-to-SM copy.
         cluster_mask: Bitmask of CTAs that participate in TMA multicast.
-        remote_barrier: Shared-memory mbarrier for asynchronous SM-to-SM copy
-            completion signalling.  The destination CTA should wait on its
-            local copy of this barrier.
+        remote_barrier: Shared-memory mbarrier used for copy completion. For
+            TMA multicast, the copy waits for completion and synchronizes its
+            participating threads; different barrier slots may be passed on
+            different invocations. For asynchronous SM-to-SM copy, the
+            destination CTA must wait on its local copy of this barrier.
         eviction_policy: Cache eviction hint passed to the TMA instruction.
             Only relevant for the TMA multicast path (``cluster_mask`` set).
         coalesced_width: Vectorization width (in elements) for the SIMT loop

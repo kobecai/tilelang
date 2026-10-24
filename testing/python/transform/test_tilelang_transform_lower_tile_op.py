@@ -129,7 +129,7 @@ def test_lower_tile_op_async_copy_with_partitioned_layout(cols, vector_size, dty
 
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize("num_stages", [2, 3])
-def test_pipelined_tma_copy_compiler_generated_barrier_uses_emitted_loop_epoch(num_stages):
+def test_pipelined_tma_copy_compiler_generated_barrier_uses_arrival_state(num_stages):
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
 
     @T.prim_func
@@ -161,24 +161,20 @@ def test_pipelined_tma_copy_compiler_generated_barrier_uses_emitted_loop_epoch(n
         mod = tl.transform.LowerTileOp()(mod)
 
     func = mod["main"]
-    waits = collect_calls(func, op="tl.mbarrier_wait_parity")
+    waits = collect_calls(func, op="tl.mbarrier_arrive_and_wait")
     loop = _find_loop_with_annotation(func, "tl_pipelined_num_stages")
-    loop_waits = collect_calls(loop, op="tl.mbarrier_wait_parity")
+    loop_waits = collect_calls(loop, op="tl.mbarrier_arrive_and_wait")
 
     assert len(waits) == num_stages
     assert len(loop_waits) == 1
     barrier_indices = [int(wait.args[0].indices[0]) for wait in waits]
     assert sorted(barrier_indices) == list(range(num_stages))
-    simplified_phases = [tvm.arith.Analyzer().simplify(wait.args[1]) for wait in waits]
-    constant_phases = [int(phase) for phase in simplified_phases if isinstance(phase, tvm.tirx.IntImm)]
-    assert constant_phases == [0] * (num_stages - 1)
-    expected = (loop.loop_var - loop.min) % 2
-    assert tvm.arith.Analyzer().can_prove_equal(loop_waits[0].args[1], expected)
+    assert not collect_calls(func, op="tl.mbarrier_wait_parity")
 
 
 @tilelang.testing.requires_cuda
 @pytest.mark.parametrize("num_stages", [2, 3])
-def test_pipelined_tma_copy_explicit_mbar_uses_logical_epoch(num_stages):
+def test_pipelined_tma_copy_explicit_mbar_uses_arrival_state(num_stages):
     target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
 
     @T.prim_func
@@ -214,19 +210,85 @@ def test_pipelined_tma_copy_explicit_mbar_uses_logical_epoch(num_stages):
         mod = tl.transform.LowerTileOp()(mod)
 
     func = mod["main"]
-    waits = collect_calls(func, op="tl.mbarrier_wait_parity")
+    waits = collect_calls(func, op="tl.mbarrier_arrive_and_wait")
     loop = _find_loop_with_annotation(func, "tl_pipelined_num_stages")
-    loop_waits = collect_calls(loop, op="tl.mbarrier_wait_parity")
+    loop_waits = collect_calls(loop, op="tl.mbarrier_arrive_and_wait")
 
     assert len(waits) == num_stages
     assert len(loop_waits) == 1
     barrier_indices = [int(wait.args[0].indices[0]) for wait in waits]
     assert barrier_indices == [0] * num_stages
-    simplified_phases = [tvm.arith.Analyzer().simplify(wait.args[1]) for wait in waits]
-    constant_phases = [int(phase) for phase in simplified_phases if isinstance(phase, tvm.tirx.IntImm)]
-    assert constant_phases == [i % 2 for i in range(num_stages - 1)]
-    logical_epoch = loop.loop_var - loop.min + num_stages - 1
-    assert tvm.arith.Analyzer().can_prove_equal(loop_waits[0].args[1], logical_epoch % 2)
+    assert not collect_calls(func, op="tl.mbarrier_wait_parity")
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize("disable_insertion", [False, True])
+def test_sync_tma_wait_publishes_to_partial_thread_scope(disable_insertion):
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
+
+    @T.prim_func
+    def main(A: T.Tensor((32, 32), T.float32)):
+        with T.Kernel(1, threads=256):
+            shared = T.alloc_shared((32, 32), T.float32)
+            mbar = T.alloc_barrier(1)
+            tx = T.get_thread_binding()
+            if tx >= 128:
+                T.copy(A, shared, prefer_instruction="tma", annotations={"barrier": mbar[0]})
+
+    mod = tvm.IRModule.from_expr(main)
+    config = {"tl.disable_thread_storage_sync": disable_insertion}
+    with target, tvm.transform.PassContext(config=config):
+        mod = tvm.tirx.transform.BindTarget(target)(mod)
+        mod = tl.transform.MaterializeKernelLaunch()(mod)
+        mod = tl.transform.LayoutInference()(mod)
+        mod = tl.transform.LowerTileOp()(mod)
+        mod = tl.transform.ThreadSync("shared")(mod)
+
+    func = mod["main"]
+    waits = collect_calls(func, op="tl.mbarrier_arrive_and_wait")
+    assert len(waits) == 1
+    syncs = collect_calls(func, op="tirx.tvm_storage_sync")
+    assert len(syncs) == 1
+    assert len(syncs[0].args) == 3
+    assert int(syncs[0].args[2]) == 128
+    # The rendezvous must be outside the elected leader's branch and after its
+    # wait, so every participant observes the leader's completion acquire.
+    assert any(
+        len(seq.seq) == 2
+        and isinstance(seq.seq[0], tvm.tirx.IfThenElse)
+        and collect_calls(seq.seq[0].then_case, op="tl.mbarrier_arrive_and_wait")
+        and isinstance(seq.seq[1], tvm.tirx.Evaluate)
+        and seq.seq[1].value.same_as(syncs[0])
+        for seq in collect_nodes(func, tvm.tirx.SeqStmt)
+    )
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize("multicast", [False, True])
+def test_explicit_tma_copy_does_not_implicitly_wait_or_sync(multicast):
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
+
+    @T.prim_func
+    def main(A: T.Tensor((32, 32), T.float32)):
+        with T.ClusterKernel(2, cluster_dims=(2, 1, 1), threads=128):
+            shared = T.alloc_shared((32, 32), T.float32)
+            mbar = T.alloc_barrier(1)
+            T.tma_copy(A, shared, barrier=mbar[0], cluster_mask=3 if multicast else None)
+
+    mod = tvm.IRModule.from_expr(main)
+    with target:
+        mod = tvm.tirx.transform.BindTarget(target)(mod)
+        mod = tl.transform.MaterializeKernelLaunch()(mod)
+        mod = tl.transform.LayoutInference()(mod)
+        mod = tl.transform.LowerTileOp()(mod)
+
+    func = mod["main"]
+    assert_call_count(func, op="tl.mbarrier_expect_tx", count=1)
+    assert_call_count(func, op="tl.tma_load_multicast" if multicast else "tl.tma_load", count=1)
+    assert not collect_calls(func, op="tl.mbarrier_arrive_and_wait")
+    assert not collect_calls(func, op="tl.mbarrier_wait_parity")
+    assert not collect_calls(func, op="tirx.ptx_arrive_barrier")
+    assert not collect_calls(func, op="tirx.tvm_storage_sync")
 
 
 def test_lower_tile_op_respects_parallel_loop_async_annotation_without_pipeline_context():

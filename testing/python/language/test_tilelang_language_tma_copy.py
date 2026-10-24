@@ -828,6 +828,7 @@ def test_tma_copy_cluster_mask_multicast():
     iters, slots = 8, 4
     kernel = tilelang.compile(cluster_multicast_tma_copy_kernel(iters, slots), out_idx=[1])
     assert "tma_load_multicast" in kernel.get_kernel_source()
+    assert ".arrive_and_wait();" not in kernel.get_kernel_source()
 
     torch.manual_seed(0)
     A = torch.randn(iters, 64, 64, device="cuda", dtype=torch.float32)

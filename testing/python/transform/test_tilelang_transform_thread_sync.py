@@ -1104,6 +1104,26 @@ def test_partial_sync_warp_multiple_still_lowered():
     assert not _storage_syncs(guard)
 
 
+@pytest.mark.parametrize("disable_insertion", [False, True])
+def test_explicit_partial_sync_is_lowered_with_insertion_disabled(disable_insertion):
+    """Disabling the planner must not leave a full-CTA sync in a half CTA."""
+
+    @T.prim_func(private=True)
+    def func():
+        tx = T.launch_thread("threadIdx.x", 256)
+        if tx >= 128:
+            T.evaluate(T.tvm_storage_sync("shared"))
+
+    mod = tvm.IRModule({"main": func})
+    with tvm.transform.PassContext(config={"tl.disable_thread_storage_sync": disable_insertion}):
+        mod = tilelang.transform.ThreadSync("shared")(mod)
+    guard = _guard(mod["main"], _thread_var(mod["main"]) >= 128)
+    syncs = _assert_syncs_inside(mod["main"], guard.then_case, arg_count=3)
+    assert len(syncs) == 1
+    _assert_partial_sync_params(syncs, 128)
+    assert not _storage_syncs(mod["main"])
+
+
 # =============================================================================
 # Tests for flat Bind definitions inside the recorded constraint sets
 #

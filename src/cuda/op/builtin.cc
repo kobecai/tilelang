@@ -157,6 +157,11 @@ TIR_DEFINE_TL_BUILTIN(ptx_arrive_cluster_barrier)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(mbarrier_arrive_and_wait)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ptx_wgmma_ss)
     .set_num_inputs(15)
     .set_attr<TCallEffectKind>("TCallEffectKind",

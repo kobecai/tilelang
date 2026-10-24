@@ -1,9 +1,84 @@
 """TMA multicast validation."""
 
+import pytest
 import torch
 import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tilelang import tvm
+
+
+_BARRIER_REUSE_CASES = ["single", "fresh", "ring", "two_calls", "conditional", "nested", "unrolled"]
+
+
+def make_sync_multicast_barrier_kernel(mode):
+    @T.macro
+    def transfer(A, B, shared, bar, rank, iteration, slot):
+        T.copy_cluster(A[iteration, :, :], shared[slot, :, :], cluster_mask=0b0011, remote_barrier=bar[slot])
+        T.copy(shared[slot, :, :], B[rank, iteration, :, :], prefer_instruction="sync")
+        # Isolate phase selection from cross-CTA destination/barrier reuse.
+        T.cluster_sync()
+
+    @T.prim_func
+    def main(A: T.Tensor((8, 32, 32), T.float32), B: T.Tensor((4, 8, 32, 32), T.float32)):
+        with T.ClusterKernel(4, cluster_dims=(4, 1, 1), threads=128) as rank:
+            shared = T.alloc_shared((8, 32, 32), T.float32)
+            bar = T.alloc_cluster_barrier([1] * 8)
+            if mode == "two_calls":
+                for i in T.serial(4):
+                    transfer(A, B, shared, bar, rank, 2 * i, 0)
+                    transfer(A, B, shared, bar, rank, 2 * i + 1, 0)
+            elif mode == "nested":
+                for outer in T.serial(2):
+                    for inner in T.serial(3):
+                        transfer(A, B, shared, bar, rank, 3 * outer + inner, 0)
+            elif mode == "unrolled":
+                for i in T.unroll(8):
+                    transfer(A, B, shared, bar, rank, i, 0)
+            elif mode == "conditional":
+                for i in T.serial(8):
+                    if i % 2 == 0:
+                        transfer(A, B, shared, bar, rank, i, 0)
+            else:
+                for i in T.serial(8):
+                    slot = 0 if mode == "single" else (i if mode == "fresh" else i % 4)
+                    transfer(A, B, shared, bar, rank, i, slot)
+
+    return main
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize("mode", _BARRIER_REUSE_CASES)
+def test_sync_multicast_barrier_reuse_codegen(mode):
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
+    with target, tvm.transform.PassContext(config={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}):
+        artifact = tilelang.lower(make_sync_multicast_barrier_kernel(mode), target=target)
+    source = artifact.kernel_source
+    assert source is not None
+    assert "tma_load_multicast" in source
+    assert ".arrive_and_wait();" in source
+    assert ".wait(" not in source
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
+@pytest.mark.parametrize("mode", _BARRIER_REUSE_CASES)
+def test_sync_multicast_barrier_reuse(mode):
+    kernel = tilelang.compile(
+        make_sync_multicast_barrier_kernel(mode),
+        pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True},
+    )
+    # Every iteration differs, so a stale tile cannot accidentally compare equal.
+    A = torch.arange(8 * 32 * 32, device="cuda", dtype=torch.float32).reshape(8, 32, 32)
+    expected = A.clone()
+    if mode == "conditional":
+        expected[1::2] = 0
+    elif mode == "nested":
+        expected[6:] = 0
+    for _ in range(3):
+        B = torch.zeros((4, 8, 32, 32), device="cuda", dtype=torch.float32)
+        kernel(A, B)
+        torch.testing.assert_close(B, expected.unsqueeze(0).expand_as(B), rtol=0, atol=0)
 
 
 def make_tma_multicast_demo_kernel(M, N, block_M, block_N, cluster_mask):

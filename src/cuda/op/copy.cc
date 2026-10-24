@@ -107,15 +107,6 @@ bool IsProvably16ByteMultiple(const PrimExpr &bytes,
                                  IntImm(bytes.dtype(), 0));
 }
 
-PrimExpr GetCopyMbarPhaseExpr(const Map<String, ObjectRef> &annotations,
-                              const LowerArgs &lower_args) {
-  PrimExpr phase = lower_args.mbar_phase_expr;
-  if (auto explicit_phase = GetAnnotatedMbarPhaseExpr(annotations)) {
-    phase = explicit_phase.value();
-  }
-  return phase;
-}
-
 std::string SanitizeIdentifierPart(const std::string &name) {
   std::string sanitized;
   sanitized.reserve(name.size());
@@ -231,6 +222,28 @@ PrimExpr GetLeaderScopeThreads(const CopyNode &op,
     return IntImm(DataType::Int(32), int_val->value);
   }
   return lower_args.thread_bounds->extent;
+}
+
+Stmt MakeSynchronousTmaLoad(const PrimExpr &barrier,
+                            const PrimExpr &total_bytes, const Stmt &copy,
+                            const PrimExpr &leader_scope,
+                            const LowerArgs &lower_args) {
+  Stmt producer = IfThenElse(
+      MakeTmaLeaderCondition(leader_scope),
+      SeqStmt({Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
+                             {barrier, total_bytes})),
+               copy,
+               Evaluate(Call(DataType::Handle(), mbarrier_arrive_and_wait(),
+                             {barrier}))}));
+  if (is_one(lower_args.thread_bounds->extent)) {
+    return producer;
+  }
+  // The leader acquired the TMA completion. Publish it to the participating
+  // threads; ThreadSync lowers this to a named barrier in partial-thread
+  // scopes.
+  Stmt sync = Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
+                            {StringImm("shared")}));
+  return SeqStmt({producer, sync});
 }
 
 bool IsContiguousRegion(const Buffer &buf, const Array<Range> &ranges,
@@ -2305,56 +2318,40 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &lower_args,
           TMATransactionBytesFromElements(total_elements, shared_tensor->dtype);
     }
 
+    if (!GetIsTmaCopy(op)) {
+      return MakeSynchronousTmaLoad(mbar_handle, total_bytes, tma_copy,
+                                    GetLeaderScopeThreads(op, lower_args),
+                                    lower_args);
+    }
+
     Stmt barrier_before_tma_stmt;
-    Optional<Stmt> barrier_after_tma_stmt = std::nullopt;
-    if (GetIsTmaCopy(op)) {
-      if (is_cluster_barrier) {
-        PrimExpr cluster_total_bytes =
-            total_bytes * IntImm(DataType::Int(32), lower_args.cluster_size);
-        Stmt expect_stmt =
-            Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
-                          {mbar_handle, cluster_total_bytes}));
-        PrimExpr rank = Call(DataType::Int(32), block_rank_in_cluster(), {});
-        barrier_before_tma_stmt =
-            IfThenElse(EQ(rank, IntImm(DataType::Int(32), 0)), expect_stmt);
-      } else {
-        barrier_before_tma_stmt =
-            Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
-                          {mbar_handle, total_bytes}));
-      }
-      if (auto emit_arrive_val = annotations.Get("emit_arrive")) {
-        if (Downcast<IntImm>(emit_arrive_val.value())->value != 0) {
-          barrier_after_tma_stmt =
-              Evaluate(Call(DataType::Handle(), builtin::ptx_arrive_barrier(),
-                            {mbar_handle}));
-        }
-      }
+    if (is_cluster_barrier) {
+      PrimExpr cluster_total_bytes =
+          total_bytes * IntImm(DataType::Int(32), lower_args.cluster_size);
+      Stmt expect_stmt = Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
+                                       {mbar_handle, cluster_total_bytes}));
+      PrimExpr rank = Call(DataType::Int(32), block_rank_in_cluster(), {});
+      barrier_before_tma_stmt =
+          IfThenElse(EQ(rank, IntImm(DataType::Int(32), 0)), expect_stmt);
     } else {
       barrier_before_tma_stmt =
           Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
                         {mbar_handle, total_bytes}));
-      barrier_after_tma_stmt = Evaluate(Call(
-          DataType::Handle(), builtin::ptx_arrive_barrier(), {mbar_handle}));
     }
 
     Array<Stmt> producer_seq{barrier_before_tma_stmt, tma_copy};
-    if (barrier_after_tma_stmt.defined()) {
-      producer_seq.push_back(barrier_after_tma_stmt.value());
+    if (auto emit_arrive_val = annotations.Get("emit_arrive")) {
+      if (Downcast<IntImm>(emit_arrive_val.value())->value != 0) {
+        producer_seq.push_back(Evaluate(Call(
+            DataType::Handle(), builtin::ptx_arrive_barrier(), {mbar_handle})));
+      }
     }
 
     Stmt producer = IfThenElse(
         MakeTmaLeaderCondition(GetLeaderScopeThreads(op, lower_args)),
         SeqStmt(producer_seq));
 
-    if (GetIsTmaCopy(op)) {
-      return producer;
-    }
-
-    Stmt wait_stmt = Evaluate(
-        Call(DataType::Handle(), mbarrier_wait_parity(),
-             {mbar_handle, GetCopyMbarPhaseExpr(annotations, lower_args)}));
-
-    return SeqStmt({producer, wait_stmt});
+    return producer;
   }
 
   tma_copy = IfThenElse(
@@ -2603,45 +2600,27 @@ Stmt Copy::LowerBulk1D(const CopyNode &op, const LowerArgs &lower_args,
   }
 
   if (is_load && barrier_base_id >= 0) {
-    Stmt barrier_before_tma_stmt;
-    Optional<Stmt> barrier_after_tma_stmt = std::nullopt;
-    if (GetIsTmaCopy(op)) {
-      barrier_before_tma_stmt =
-          Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
-                        {mbar_handle, total_bytes}));
-      if (auto emit_arrive_val = annotations.Get("emit_arrive")) {
-        if (Downcast<IntImm>(emit_arrive_val.value())->value != 0) {
-          barrier_after_tma_stmt =
-              Evaluate(Call(DataType::Handle(), builtin::ptx_arrive_barrier(),
-                            {mbar_handle}));
-        }
-      }
-    } else {
-      barrier_before_tma_stmt =
-          Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
-                        {mbar_handle, total_bytes}));
-      barrier_after_tma_stmt = Evaluate(Call(
-          DataType::Handle(), builtin::ptx_arrive_barrier(), {mbar_handle}));
+    if (!GetIsTmaCopy(op)) {
+      return MakeSynchronousTmaLoad(mbar_handle, total_bytes, tma_copy,
+                                    GetLeaderScopeThreads(op, lower_args),
+                                    lower_args);
     }
+    Stmt barrier_before_tma_stmt = Evaluate(Call(
+        DataType::Handle(), mbarrier_expect_tx(), {mbar_handle, total_bytes}));
 
     Array<Stmt> producer_seq{barrier_before_tma_stmt, tma_copy};
-    if (barrier_after_tma_stmt.defined()) {
-      producer_seq.push_back(barrier_after_tma_stmt.value());
+    if (auto emit_arrive_val = annotations.Get("emit_arrive")) {
+      if (Downcast<IntImm>(emit_arrive_val.value())->value != 0) {
+        producer_seq.push_back(Evaluate(Call(
+            DataType::Handle(), builtin::ptx_arrive_barrier(), {mbar_handle})));
+      }
     }
 
     Stmt producer = IfThenElse(
         MakeTmaLeaderCondition(GetLeaderScopeThreads(op, lower_args)),
         SeqStmt(producer_seq));
 
-    if (GetIsTmaCopy(op)) {
-      return producer;
-    }
-
-    Stmt wait_stmt = Evaluate(
-        Call(DataType::Handle(), mbarrier_wait_parity(),
-             {mbar_handle, GetCopyMbarPhaseExpr(annotations, lower_args)}));
-
-    return SeqStmt({producer, wait_stmt});
+    return producer;
   }
 
   tma_copy = IfThenElse(
@@ -2786,19 +2765,8 @@ Stmt Im2Col::Lower(const Im2ColOpNode &op, const LowerArgs &lower_args,
           SeqStmt(producer_seq));
     }
 
-    Stmt barrier_after_tma_stmt = Evaluate(
-        Call(DataType::Handle(), builtin::ptx_arrive_barrier(), {mbar_handle}));
-
-    Stmt producer =
-        IfThenElse(MakeTmaLeaderCondition(lower_args.thread_bounds->extent),
-                   SeqStmt({barrier_before_tma_stmt, tma_copy_stmt,
-                            barrier_after_tma_stmt}));
-
-    Stmt wait_stmt = Evaluate(
-        Call(DataType::Handle(), mbarrier_wait_parity(),
-             {mbar_handle, GetCopyMbarPhaseExpr(op.annotations_, lower_args)}));
-
-    return SeqStmt({producer, wait_stmt});
+    return MakeSynchronousTmaLoad(mbar_handle, total_bytes, tma_copy_stmt,
+                                  lower_args.thread_bounds->extent, lower_args);
   }
 
   return IfThenElse(MakeTmaLeaderCondition(lower_args.thread_bounds->extent),

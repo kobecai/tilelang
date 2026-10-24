@@ -87,6 +87,24 @@ TL_DEVICE void mbarrier_arrive(uint64_t &smem_barrier) {
                : "r"(smem_int_ptr));
 }
 
+TL_DEVICE void mbarrier_arrive_and_wait(uint64_t &smem_barrier) {
+  uint32_t smem_int_ptr = smem_ptr_to_uint(&smem_barrier);
+  // Bind the wait to this arrival, including when the barrier slot or its
+  // invocation count differs from the enclosing loop's iteration count.
+  asm volatile("{\n\t"
+               ".reg .b64 state;\n\t"
+               ".reg .pred complete;\n\t"
+               "mbarrier.arrive.shared::cta.b64 state, [%0];\n\t"
+               "WAIT:\n\t"
+               "mbarrier.try_wait.acquire.cta.shared::cta.b64 complete, [%0], "
+               "state;\n\t"
+               "@!complete bra WAIT;\n\t"
+               "}"
+               :
+               : "r"(smem_int_ptr)
+               : "memory");
+}
+
 TL_DEVICE void mbarrier_arrive(uint64_t &smem_barrier, int cta_id,
                                uint32_t pred) {
   uint32_t smem_int_ptr = smem_ptr_to_uint(&smem_barrier);
@@ -248,6 +266,10 @@ public:
   }
 
   TL_DEVICE void arrive() const { tl::mbarrier_arrive(storage()); }
+
+  TL_DEVICE void arrive_and_wait() const {
+    tl::mbarrier_arrive_and_wait(storage());
+  }
 
   TL_DEVICE void arrive(uint32_t cta_id, uint32_t pred = 1u) const {
     tl::mbarrier_arrive(storage(), cta_id, pred);

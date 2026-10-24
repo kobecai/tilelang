@@ -241,7 +241,8 @@ class PassConfigKey(str, Enum):
     automatic insertion of thread synchronization barriers (e.g., __syncthreads())
     for shared memory access coordination. This can be useful for performance
     optimization in cases where manual synchronization is preferred or when
-    synchronization is not needed. Default: False"""
+    synchronization is not needed. Existing synchronization barriers are still
+    lowered for their participating thread scope. Default: False"""
 
     TL_CPU_PARALLEL = "tl.cpu_parallel"
     """Enable OpenMP parallelization of grid loops for CPU targets.

@@ -1,3 +1,5 @@
+import re
+
 import pytest
 import tvm
 
@@ -44,9 +46,9 @@ def _make_im2col_kernel(use_deprecated_alias=False, channels=32, block_K=32, blo
     return conv
 
 
-def _lower_to_cuda_source(func, arch):
+def _lower_to_cuda_source(func, arch, pass_configs=None):
     target = {"kind": "cuda", "arch": arch}
-    with tvm.transform.PassContext(), tvm.target.Target(target):
+    with tvm.transform.PassContext(config=pass_configs), tvm.target.Target(target):
         artifact = tilelang.lower(func, target=target)
     assert artifact.kernel_source is not None
     return artifact.kernel_source
@@ -63,6 +65,24 @@ def test_im2col_uses_simt_fallback_before_hopper():
 def test_im2col_uses_tma_on_hopper():
     src = _lower_to_cuda_source(_make_im2col_kernel(), "sm_90")
     assert "tma_load_im2col" in src
+
+
+@tilelang.testing.requires_cuda
+def test_sync_im2col_uses_arrival_state():
+    @T.prim_func
+    def main(A: T.Tensor((1, 8, 8, 32), T.float16), B: T.Tensor((2, 16, 32), T.float16)):
+        with T.Kernel(1, threads=128):
+            shared = T.alloc_shared((16, 32), T.float16)
+            # The generated barrier survives the inner loop's odd trip count.
+            for outer in T.serial(2):
+                for _inner in T.serial(3):
+                    T.im2col(A, shared, 0, 0, 3, 1, 1, 1)
+                    T.copy(shared, B[outer, :, :])
+
+    src = _lower_to_cuda_source(main, "sm_90", {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+    assert "tma_load_im2col" in src
+    assert ".arrive_and_wait();" in src
+    assert not re.search(r"\.wait\(", src)
 
 
 @tilelang.testing.requires_cuda

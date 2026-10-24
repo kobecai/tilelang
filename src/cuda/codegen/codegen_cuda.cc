@@ -2812,6 +2812,11 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     auto mbarrier_obj = this->PrintExpr(op->args[0]);
     this->stream << mbarrier_obj << ".arrive();\n";
+  } else if (op->op.same_as(tl::mbarrier_arrive_and_wait())) {
+    need_barrier_h_ = true;
+    ICHECK_EQ(op->args.size(), 1);
+    this->PrintIndent();
+    this->stream << this->PrintExpr(op->args[0]) << ".arrive_and_wait();\n";
   } else if (op->op.same_as(tl::ptx_arrive_cluster_barrier())) {
     need_barrier_h_ = true;
     ICHECK_EQ(op->args.size(), 2);

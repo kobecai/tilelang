@@ -217,6 +217,14 @@ const Op &ptx_fence_barrier_init();
 TVM_DLL const Op &ptx_arrive_cluster_barrier();
 
 /*!
+ * \brief Arrive on a local mbarrier and wait for the returned arrival state.
+ *
+ * The elected producer uses this for synchronous TMA loads. Other participating
+ * threads synchronize with that producer before consuming the loaded data.
+ */
+TVM_DLL const Op &mbarrier_arrive_and_wait();
+
+/*!
  * \brief tvm intrinsic for ptx tensor core wgmma instructions.
  *
  *  void ptx_wgmma_ss(StringImm accum_dtype, StringImm wgmma_prefix, bool

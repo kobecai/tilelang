@@ -19,6 +19,7 @@ __all__ = [
     "mbarrier_init",
     "mbarrier_expect_tx",
     "mbarrier_arrive",
+    "mbarrier_arrive_and_wait",
     "arrive_and_expect_tx",
     "mbarrier_cp_async_arrive_noinc",
     "mbarrier_wait",
@@ -359,6 +360,14 @@ def prefetch_tma_descriptor(tma_desc, *, loc=None, ip=None) -> None:
     """
     tma_desc_ptr = _as_tensormap_ptr(tma_desc, loc=loc, ip=ip)
     prims.prefetch_tensormap(tma_desc_ptr, loc=loc, ip=ip)
+
+
+@cute.jit
+def mbarrier_arrive_and_wait(mbar_ptr: Pointer) -> None:
+    """Wait for this arrival's state without inferring a loop parity."""
+    state = prims.mbarrier_arrive(mbar_ptr)
+    while not prims.mbarrier_try_wait(mbar_ptr, state):
+        pass
 
 
 @cute.jit

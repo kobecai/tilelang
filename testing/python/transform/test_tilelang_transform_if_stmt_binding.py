@@ -1,4 +1,5 @@
 from tilelang import tvm as tvm
+import pytest
 import tilelang
 import tilelang.testing
 from tvm.script import tirx as T
@@ -109,6 +110,54 @@ def test_if_stmt_binding_inlines_replayable_bind_by_default():
 
     after = _run_if_stmt_binding(before)
     tvm.ir.assert_structural_equal(after.body, expected.body, True)
+
+
+@pytest.mark.parametrize("depth", [10, 14])
+def test_if_stmt_binding_bounds_repeated_bind_expansion(depth):
+    """Repeated uses must not expand a linear Bind chain into a large tree."""
+    tir = tvm.tirx
+    source = tir.decl_buffer((1,), "float32", name="source")
+    output = tir.decl_buffer((2,), "float32", name="output")
+    flag = tir.Var("flag", "int32")
+    value = tir.Var("x0", "float32")
+    stmts = [tir.Bind(value, source[0] + tir.const(0.5, "float32"))]
+    for i in range(depth):
+        next_value = tir.Var(f"x{i + 1}", "float32")
+        stmts.append(tir.Bind(next_value, tir.Add(value, value)))
+        value = next_value
+    # Both consumers must stay in scope when an intermediate Bind is retained.
+    stmts.extend([tir.BufferStore(output, value, [0]), tir.BufferStore(output, value + tir.const(1, "float32"), [1])])
+    before = tir.PrimFunc(
+        [source.data, output.data, flag],
+        tir.IfThenElse(flag > 0, tir.SeqStmt(stmts), None),
+        buffer_map={source.data: source, output.data: output},
+    )
+    after = _run_if_stmt_binding(before)
+    # Avoid printing the expanded IR in pytest's assertion diagnostics.
+    keeps_scope = isinstance(after.body, tir.IfThenElse)
+    assert keeps_scope, "Preserve the Bind chain and its consumers in one guard"
+    assert isinstance(after.body.then_case, tir.SeqStmt)
+    binds = [stmt for stmt in after.body.then_case.seq if isinstance(stmt, tir.Bind)]
+    assert binds, "Preserve a temporary instead of fully expanding the chain"
+    assert after.body.then_case.seq[-2].value.same_as(binds[-1].var)
+    assert after.body.then_case.seq[-1].value.a.same_as(binds[-1].var)
+    assert tir.analysis.verify_well_formed(after)
+
+    # Count tree occurrences, including shared subexpressions, with an early
+    # cutoff so a regression fails quickly even for a deep doubling chain.
+    def count_source_loads(expr):
+        if isinstance(expr, tir.BufferLoad):
+            return int(expr.buffer.same_as(source))
+        if isinstance(expr, tir.Add):
+            left = count_source_loads(expr.a)
+            assert left <= 32
+            count = left + count_source_loads(expr.b)
+            assert count <= 32
+            return count
+        return 0
+
+    for bind in binds:
+        assert count_source_loads(bind.value) <= 32
 
 
 def test_if_stmt_binding_does_not_inline_pointer_bind():

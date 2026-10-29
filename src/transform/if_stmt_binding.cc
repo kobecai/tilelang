@@ -39,6 +39,30 @@ private:
   explicit IfStmtBindingRewriter(bool inline_replayable_binds)
       : inline_replayable_binds_(inline_replayable_binds) {}
 
+  class BindExpansionCounter : public ExprVisitor {
+  public:
+    static bool CanInline(const PrimExpr &value) {
+      BindExpansionCounter counter;
+      counter.VisitExpr(value);
+      return counter.node_count_ <= kMaxInlineNodes;
+    }
+
+  private:
+    void VisitExpr(const PrimExpr &expr) final {
+      if (node_count_ > kMaxInlineNodes) {
+        return;
+      }
+      ++node_count_;
+      ExprVisitor::VisitExpr(expr);
+    }
+
+    // Count tree occurrences, including shared subexpressions: downstream
+    // visitors may revisit both operands of x + x. Stop counting once the
+    // budget is exceeded so the check itself cannot grow exponentially.
+    static constexpr int kMaxInlineNodes = 64;
+    int node_count_{0};
+  };
+
   class IfStmtAccessCollector : public StmtExprVisitor {
   public:
     explicit IfStmtAccessCollector(Map<Var, Buffer> buffer_data_to_buffer)
@@ -262,9 +286,12 @@ private:
       if (!in_bind_scope) {
         if (const auto *bind = stmt.as<BindNode>()) {
           if (IsReplayableBindStmt(stmt, write_buffers)) {
-            replayable_binds.Set(bind->var, RewriteWithReplayableBinds(
-                                                bind->value, replayable_binds));
-            continue;
+            PrimExpr value =
+                RewriteWithReplayableBinds(bind->value, replayable_binds);
+            if (BindExpansionCounter::CanInline(value)) {
+              replayable_binds.Set(bind->var, value);
+              continue;
+            }
           }
           bind_scope.push_back(
               RewriteBindWithReplayableBinds(bind, replayable_binds));

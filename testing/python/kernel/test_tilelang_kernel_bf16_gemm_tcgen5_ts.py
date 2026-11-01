@@ -4,6 +4,7 @@ Validates the chained GEMM pattern: SS GEMM → tcgen05.ld → cast → tcgen05.
 which is the core building block for Flash Attention on Blackwell.
 """
 
+import pytest
 import torch
 import tilelang
 import tilelang.testing
@@ -174,14 +175,18 @@ def assert_chained_gemm(M, N1, N2, K, bM, bN1, bN2, bK, threads=128):
 
 @tilelang.testing.requires_cuda
 @tilelang.testing.requires_cuda_compute_version(10)
-def test_ss_gemm_bf16_baseline():
-    assert_ss_gemm(128, 128, 128, 128, 128, 128)
+@tilelang.testing.requires_cuda_compute_version_lt(11)
+@pytest.mark.parametrize("N, K, threads", [(128, 128, 128), (128, 64, 384), (384, 64, 640)])
+def test_ss_gemm_bf16_baseline(N, K, threads):
+    assert_ss_gemm(128, N, K, 128, N, K, threads=threads)
 
 
 @tilelang.testing.requires_cuda
 @tilelang.testing.requires_cuda_compute_version(10)
-def test_chained_gemm_128():
-    assert_chained_gemm(128, 128, 128, 128, 128, 128, 128, 128)
+@tilelang.testing.requires_cuda_compute_version_lt(11)
+@pytest.mark.parametrize("threads", [128, 384])
+def test_chained_gemm_128(threads):
+    assert_chained_gemm(128, 128, 128, 128, 128, 128, 128, 128, threads=threads)
 
 
 @tilelang.testing.requires_cuda
@@ -197,7 +202,4 @@ def test_chained_gemm_non_power_of_2_k():
 
 
 if __name__ == "__main__":
-    test_ss_gemm_bf16_baseline()
-    test_chained_gemm_128()
-    test_chained_gemm_256()
-    test_chained_gemm_non_power_of_2_k()
+    tilelang.testing.main()

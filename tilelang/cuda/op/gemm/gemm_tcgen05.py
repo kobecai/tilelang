@@ -55,7 +55,9 @@ class GemmTCGEN5(GemmBase):
         return bool(annotations.get("use_2cta", 0))
 
     def _warp_partition(self, target: Target, thread_nums: int) -> tuple[int, int]:
-        return self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GEMM_INST_TCGEN05)
+        # One warp issues the whole TCGEN05 tile. Partitioning it over all
+        # block warps would truncate N when it is not divisible by that count.
+        return 1, 1
 
     def _make_mma_emitter(self, target: Target, thread_nums: int) -> TensorCoreIntrinEmitter:
         m_warp, n_warp = self._warp_partition(target, thread_nums)

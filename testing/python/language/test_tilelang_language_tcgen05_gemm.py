@@ -21,14 +21,14 @@ def _assert_error_at(excinfo, marker: str):
     assert marker in message, f"source snippet was not rendered:\n{message}"
 
 
-def _make_sync_tcgen05_kernel(gemm_op):
+def _make_sync_tcgen05_kernel(gemm_op, threads=128):
     @T.prim_func
     def main(
         A: T.Tensor((128, 128), T.bfloat16),
         B: T.Tensor((128, 128), T.bfloat16),
         D: T.Tensor((128, 128), T.bfloat16),
     ):
-        with T.Kernel(1, threads=128):
+        with T.Kernel(1, threads=threads):
             A_shared = T.alloc_shared((128, 128), T.bfloat16)
             B_shared = T.alloc_shared((128, 128), T.bfloat16)
             C_tmem = T.alloc_tmem((128, 128), T.float32)
@@ -314,6 +314,53 @@ def _make_2cta_invalid_cluster_kernel():
             )
 
     return main
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    "gemm_api, a_scope, N, threads, control_threads",
+    [
+        ("gemm", "shared", 128, 384, 256),
+        ("tcgen05_gemm", "shared", 128, 384, 256),
+        ("tcgen05_gemm", "shared.tmem", 128, 384, 256),
+        ("gemm", "shared", 384, 640, 384),
+    ],
+)
+def test_tcgen05_gemm_covers_tile_with_nondivisible_warps(gemm_api, a_scope, N, threads, control_threads):
+    """Issue #3721: changing the block's warp count must not drop MMA atoms."""
+    tirx = tvm.tirx
+    A = tirx.decl_buffer((128, 64), "float16", name="A", scope=a_scope)
+    B = tirx.decl_buffer((N, 64), "float16", name="B", scope="shared")
+    C = tirx.decl_buffer((128, N), "float32", name="C", scope="shared.tmem")
+    done = tirx.decl_buffer((1,), "uint64", name="done", scope="shared.barrier")
+    call = getattr(T, gemm_api)(A, B, C, transpose_B=True, mbar=done[0], clear_accum=True)
+    op = call.op.get_attr("TLOpBuilder")(call.args, call.annotations)
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
+
+    def lower(num_threads):
+        with target:
+            layouts = op.infer_layout(target, num_threads)
+            return op.lower(layouts, target, tvm.ir.Range(0, num_threads), tirx.Var("tx", "int32"), tirx.const(0, "int32"))
+
+    # Compare the complete MMA body, including N-loop coverage and addresses.
+    # Merely finding an MMA would miss the N=384 case losing its second atom.
+    tvm.ir.assert_structural_equal(lower(control_threads), lower(threads), map_free_vars=True)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(10)
+@tilelang.testing.requires_cuda_compute_version_lt(11)
+def test_sync_tcgen05_gemm_nondivisible_warps_correctness():
+    import torch
+
+    def sync_api(A, B, C, mbar):
+        return T.gemm(A, B, C, transpose_B=True, mbar=mbar, clear_accum=True)
+
+    kernel = tilelang.compile(_make_sync_tcgen05_kernel(sync_api, threads=384), out_idx=-1, target="cuda")
+    a = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    ref = (a.cpu().float() @ b.cpu().float().T).to(torch.bfloat16)
+    torch.testing.assert_close(kernel(a, b).cpu(), ref, rtol=1e-2, atol=1e-2)
 
 
 @tilelang.testing.requires_cuda

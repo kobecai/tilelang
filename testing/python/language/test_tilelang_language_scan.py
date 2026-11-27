@@ -234,6 +234,68 @@ def test_cumsum_smem_pipelined(dim):
     torch.testing.assert_close(jit_kernel(A), ref, atol=1e-3, rtol=1e-3)
 
 
+def staged_scan_kernel(shape, op, dim):
+    tensor_shape = (4,) + shape
+    origin = (0,) * len(shape)
+    scan = T.cumsum if op == "cumsum" else T.cummax
+    # Separate the 1D scan from both copies so both operands are multi-buffered.
+    # In 2D, keep the scan and output copy together to leave the output unversioned.
+    stages = [0, 1, 2] if len(shape) == 1 else [0, 1, 1]
+
+    @T.prim_func
+    def main(X: T.Tensor(tensor_shape, T.float32), Y: T.Tensor(tensor_shape, T.float32)):
+        with T.Kernel(1, threads=128):
+            inp = T.alloc_shared(shape, T.float32)
+            out = T.alloc_shared(shape, T.float32)
+            for t in T.Pipelined(4, order=[0, 1, 2], stage=stages):
+                T.copy(X[(t,) + origin], inp)
+                scan(inp, out, dim=dim)
+                T.copy(out, Y[(t,) + origin])
+
+    return main
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    ("shape", "op", "dim"),
+    [
+        pytest.param((64,), "cumsum", 0, id="1d-cumsum"),
+        pytest.param((4, 64), "cumsum", 1, id="2d-cumsum"),
+        pytest.param((4, 64), "cummax", 0, id="2d-cummax"),
+        pytest.param((1, 64), "cumsum", 0, id="2d-singleton-axis"),
+    ],
+)
+def test_shared_scan_pipeline_stage_axis(shape, op, dim):
+    program = staged_scan_kernel(shape, op, dim)
+    kernel = tl.compile(program, out_idx=-1, target="cuda", pass_configs={tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+    x = torch.randint(-3, 4, (4,) + shape, device="cuda").float()
+    ref = x.cumsum(dim=dim + 1) if op == "cumsum" else x.cummax(dim=dim + 1).values
+    torch.testing.assert_close(kernel(x), ref, rtol=0, atol=0)
+
+
+@T.prim_func
+def warp_specialized_scan_kernel(X: T.Tensor((64, 64), T.float32), Y: T.Tensor((64, 64), T.float32)):
+    with T.Kernel(1, threads=128):
+        frag = T.alloc_fragment((64, 64), T.float32)
+        smem = T.alloc_shared((64, 64), T.float32)
+        T.copy(X, frag)
+        T.copy(frag, smem)
+        T.cumsum(smem, dim=1)
+        T.copy(smem, Y)
+
+
+@tilelang.testing.requires_cuda_compute_version_ge(9)
+def test_shared_scan_role_based_stage_axis():
+    kernel = tl.compile(
+        warp_specialized_scan_kernel,
+        out_idx=-1,
+        target="cuda",
+        pass_configs={tl.PassConfigKey.TL_ENABLE_AUTO_WARP_SPECIALIZATION: "role_based"},
+    )
+    x = torch.randint(-3, 4, (64, 64), device="cuda").float()
+    torch.testing.assert_close(kernel(x), x.cumsum(dim=1), rtol=0, atol=0)
+
+
 def cumsum_region_test_1d(N, chunk_size, reverse=False, dtype=T.float32):
     """Test cumsum with buffer region (slice) as input."""
     import tilelang.language as T

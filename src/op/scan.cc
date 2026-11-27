@@ -53,6 +53,7 @@ const Impl &ResolveScanImpl(Target target, const char *op_name) {
 
 template <typename ScanOpNode>
 void InitScanOpNode(ScanOpNode *node, const Array<PrimExpr> &args,
+                    const Map<String, ObjectRef> &annotations,
                     const char *op_name) {
   ICHECK_EQ(args.size(), 4);
   auto src_access = NormalizeToAccessRegion(args[0], kAccessRead);
@@ -62,12 +63,19 @@ void InitScanOpNode(ScanOpNode *node, const Array<PrimExpr> &args,
   node->SetAccessRegions({src_access, dst_access});
   node->src = node->srcRegion_->buffer;
   node->dst = node->dstRegion_->buffer;
+  node->logical_rank = static_cast<int>(node->srcRegion_->region.size());
+  if (auto rank = annotations.Get("tl.scan_logical_rank")) {
+    int64_t logical_rank = Downcast<IntImm>(rank.value())->value;
+    ICHECK_GT(logical_rank, 0);
+    ICHECK_LE(logical_rank, node->logical_rank);
+    node->logical_rank = static_cast<int>(logical_rank);
+  }
   node->dim = args[2].as<IntImm>().value()->value;
   node->reverse = args[3].as<Bool>().value();
-  ICHECK_LT(node->dim, static_cast<int>(node->src->shape.size()))
+  ICHECK_LT(node->dim, node->logical_rank)
       << "The dim of " << op_name
       << " should be less than the number of dimensions. Got dim=" << node->dim
-      << ", but src has " << node->src->shape.size() << " dims.";
+      << ", but src has " << node->logical_rank << " logical dims.";
 }
 
 template <typename ScanOpNode>
@@ -134,7 +142,7 @@ TileOperator CumMaxOpNode::Clone() const {
 
 CumSumOp::CumSumOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   ObjectPtr<CumSumOpNode> node = make_object<CumSumOpNode>();
-  InitScanOpNode(node.get(), args, "cumsum");
+  InitScanOpNode(node.get(), args, annotations, "cumsum");
   data_ = std::move(node);
 }
 
@@ -156,7 +164,7 @@ TIR_REGISTER_TL_TILE_OP(CumSumOp, cumsum)
 
 CumMaxOp::CumMaxOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   ObjectPtr<CumMaxOpNode> node = make_object<CumMaxOpNode>();
-  InitScanOpNode(node.get(), args, "cummax");
+  InitScanOpNode(node.get(), args, annotations, "cummax");
   data_ = std::move(node);
 }
 

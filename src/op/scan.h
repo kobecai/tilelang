@@ -19,8 +19,9 @@ class CumSumOpNode : public TileOperatorNode {
 public:
   tirx::Buffer src, dst; ///< Source and destination buffers
   BufferRegion srcRegion_, dstRegion_;
-  int dim;      ///< Dimension along which to compute cumulative sum
-  bool reverse; ///< Whether to compute in reverse order
+  int logical_rank; ///< Rank before buffer versioning
+  int dim;          ///< Dimension along which to compute cumulative sum
+  bool reverse;     ///< Whether to compute in reverse order
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.CumSumOp", CumSumOpNode,
                                     TileOperatorNode);
 
@@ -31,6 +32,7 @@ public:
         .def_ro("dst", &CumSumOpNode::dst)
         .def_ro("srcRegion", &CumSumOpNode::srcRegion_)
         .def_ro("dstRegion", &CumSumOpNode::dstRegion_)
+        .def_ro("logical_rank", &CumSumOpNode::logical_rank)
         .def_ro("dim", &CumSumOpNode::dim)
         .def_ro("reverse", &CumSumOpNode::reverse);
   }
@@ -71,8 +73,9 @@ class CumMaxOpNode : public TileOperatorNode {
 public:
   tirx::Buffer src, dst; ///< Source and destination buffers
   BufferRegion srcRegion_, dstRegion_;
-  int dim;      ///< Dimension along which to compute cumulative maximum
-  bool reverse; ///< Whether to compute in reverse order
+  int logical_rank; ///< Rank before buffer versioning
+  int dim;          ///< Dimension along which to compute cumulative maximum
+  bool reverse;     ///< Whether to compute in reverse order
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.CumMaxOp", CumMaxOpNode,
                                     TileOperatorNode);
 
@@ -83,6 +86,7 @@ public:
         .def_ro("dst", &CumMaxOpNode::dst)
         .def_ro("srcRegion", &CumMaxOpNode::srcRegion_)
         .def_ro("dstRegion", &CumMaxOpNode::dstRegion_)
+        .def_ro("logical_rank", &CumMaxOpNode::logical_rank)
         .def_ro("dim", &CumMaxOpNode::dim)
         .def_ro("reverse", &CumMaxOpNode::reverse);
   }

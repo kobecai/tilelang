@@ -12,6 +12,21 @@ _CUMSUM_OP_KEY = "tl.tileop.cumsum"
 _CUMMAX_OP_KEY = "tl.tileop.cummax"
 
 
+def _scan_call(op_key: str, src: BufferLikeType, dst: BufferLikeType, dim: int, reverse: bool, annotations: dict | None) -> tirx.PrimExpr:
+    call_annotations = _normalize_annotations(annotations)
+    # The compiler can prepend buffer-version axes after dim is resolved.
+    call_annotations["tl.scan_logical_rank"] = tirx.IntImm("int32", len(retrieve_shape(src)))
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get(op_key),
+        to_tile_region(src, access_type="r"),
+        to_tile_region(dst, access_type="w"),
+        dim,
+        reverse,
+        annotations=call_annotations,
+    )
+
+
 @macro
 def _scan_fragment(
     src: BufferLikeType,
@@ -29,15 +44,7 @@ def _scan_fragment(
         dtype = src_buffer.dtype
     scan_smem = alloc_shared(src_shape, dtype, "shared.dyn")
     copy(src, scan_smem)
-    tirx.call_intrin(
-        "handle",
-        tirx.op.Op.get(op_key),
-        to_tile_region(scan_smem, access_type="r"),
-        to_tile_region(scan_smem, access_type="w"),
-        dim,
-        reverse,
-        annotations=_normalize_annotations(annotations),
-    )
+    _scan_call(op_key, scan_smem, scan_smem, dim, reverse, annotations)
     copy(scan_smem, dst)
 
 
@@ -141,15 +148,7 @@ def cumsum(
         cumsum_fragment(src, dst, dim, reverse, annotations)
         return
 
-    return tirx.call_intrin(
-        "handle",
-        tirx.op.Op.get(_CUMSUM_OP_KEY),
-        to_tile_region(src, access_type="r"),
-        to_tile_region(dst, access_type="w"),
-        dim,
-        reverse,
-        annotations=_normalize_annotations(annotations),
-    )
+    return _scan_call(_CUMSUM_OP_KEY, src, dst, dim, reverse, annotations)
 
 
 @macro
@@ -194,12 +193,4 @@ def cummax(
         cummax_fragment(src, dst, dim, reverse, annotations)
         return
 
-    return tirx.call_intrin(
-        "handle",
-        tirx.op.Op.get(_CUMMAX_OP_KEY),
-        to_tile_region(src, access_type="r"),
-        to_tile_region(dst, access_type="w"),
-        dim,
-        reverse,
-        annotations=_normalize_annotations(annotations),
-    )
+    return _scan_call(_CUMMAX_OP_KEY, src, dst, dim, reverse, annotations)
